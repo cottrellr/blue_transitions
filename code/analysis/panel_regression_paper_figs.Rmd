@@ -1,0 +1,192 @@
+---
+title: "Build Figure 1 for panel regression manuscript"
+author: "Danielle Ferraro"
+date: "7/8/2020"
+output: pdf_document
+---
+
+# Overview
+
+This document includes the code to build Figure 1 for Clean Seafood Track 1's panel regression manuscript. The figure contains a chloropleth map and examples of aquaculture-dominant vs. capture-dominant national time series of seafood production.
+
+# Setup
+
+Source project file paths and load packages.
+```{r setup}
+source(here::here("src", "directories.R"))
+
+library(tidyverse) # General data wrangling
+library(rnaturalearth) # For WGS84 bounding box 
+library(sf) # Spatial functions
+library(LaCroixColoR) # For color palette 
+library(ggpubr) # For theme_pubr()
+```
+
+# Load data
+
+Tidied FAO Global Production data stored on server.
+```{r load-data}
+production <- read_csv(file.path(dir_data_aquaculture, "fao_production_tidy.csv"))
+```
+
+# Wrangle data
+
+Aggregate production per year, per country, per sector with and without aquatic plants. 
+```{r calc-aggregate-production}
+# List of seaweed species defined by Rich from fisheries_panel_regression.Rmd
+seaweed_list <- as.character(expression(SWB, WAP, AJC, EEZ, UDS,UDP,ZFC,DOK,NYQ,YQT,IPD,IYJ,YKL,IYK,DVA,FUA, ASN, FUU,FDS, UCU, FCV,UCE,"FUV", FUP,ZSQ, HLZ, LAZ, LAH, LQD, LNJ,QYI,LQX,LXF,EOZ,LJZ, LJX,MXF,MXY,GQO,ZSD,ZSY,GQL,GQY,GQU,QVS,GQJ,GQK,RGV,GQB,QWX,UIO,UIC,UIU,YDL,PWF,SWR,HFH, HFJ, OFK,FRP,OFU,OFX,OFH,OFQ,PRT,FYS,PRH,OFN,YKN,GQX,GQR,ASR,JLM,BLX,KNW,KMK,KMX,KMN,KMD,KMJ,KMI,KMF,KMQ,KRQ,JNR,JNA,LHD,LJQ,LIT,FMK,YMD,YKP,KDL,SWQ,SWP,FKU,MZM,GJO,GEQ,GJC,GJP,GEW,GDK,GDX,GDH,GJJ,GDY,GEL,QTH,QTU,QTN,PKZ,OKQ,GHG,GJE,GJA,KDM,KDZ,KDI,KDW,IMS,GJK,IDC,LGY,MZL,SBQ,GCO,GKA,GKI,GCH,GKK,GKC,GCW,GJX,GJW,GLS,GZG,GKH,YNQ,YNF,YAH,YAK,YAY,YND,YEH,YAZ,YAD,YAX,YEB,KFF,KFV,NLO,RHP,MVT,MVQ, YGJ,YGF,YGN, GKF, YKE, YFQ, OKG, OTX,KHI, DMH, DGM,LVF,LVS,LVB,VLA,ISV, UKI,UKD,EMX,EMC,EMI,EMA,JZT,QVX,JZS,OIK, OKF,FCK,SWG,KQT,KQS,KQP,KQX,KQE,KQC,KQB,CAU,KQR,TZZ,KMW,KMH,KMY,KIR,KCG,KIY,KIL,KIB,KIE,KIQ,KJT,KIA,KII,UNJ,UNI,HZP,MTN,HLW,HQW,NHO,HMW,UEC,EFP,EBN,EBL,EBZ,EBP,EOW,UVU,UVI,UVQ,UVC,UVF,UVR, UYH,UVP))
+
+agg_production <- production %>% 
+  group_by(country, country_name, eco_class_group, year, sector) %>% 
+  summarize(sum_quantity = sum(quantity),
+            sum_quantity_no_seaweed = sum(quantity[!species %in% seaweed_list])) %>% 
+  ungroup() %>% 
+  mutate(country = as.integer(country)) # Covert to integer to match with panel_regression_data.csv
+```
+
+Calculate proportion of aquaculture relative to total production in model countries, with and without seaweeds.
+```{r}
+prop_aq_incl_seaweed <- agg_production %>% 
+  select(-sum_quantity_no_seaweed) %>% 
+  pivot_wider(names_from  = sector, names_glue = "{sector}_incl_seaweed", values_from = sum_quantity) %>% 
+  mutate_at(c("Capture_incl_seaweed", "Aquaculture_incl_seaweed"), replace_na, 0) %>% 
+  mutate(total_production_incl_seaweed = Capture_incl_seaweed + Aquaculture_incl_seaweed,
+         prop_aqua_incl_seaweed = Aquaculture_incl_seaweed/total_production_incl_seaweed) %>% 
+  mutate(prop_aqua_incl_seaweed = replace_na(prop_aqua_incl_seaweed, 0)) # Years w/ 0 total production
+
+prop_aq_no_seaweed <- agg_production %>% 
+  select(-sum_quantity) %>% 
+  pivot_wider(names_from  = sector, names_glue = "{sector}_no_seaweed", values_from = sum_quantity_no_seaweed) %>% 
+  mutate_at(c("Capture_no_seaweed", "Aquaculture_no_seaweed"), replace_na, 0) %>% 
+  mutate(total_production_no_seaweed = Capture_no_seaweed + Aquaculture_no_seaweed,
+         prop_aqua_no_seaweed = Aquaculture_no_seaweed/total_production_no_seaweed) %>% 
+  mutate(prop_aqua_no_seaweed = replace_na(prop_aqua_no_seaweed, 0)) # Years w/ 0 total production
+
+# Combine into one data frame
+prop_aq <- prop_aq_incl_seaweed %>% 
+  left_join(prop_aq_no_seaweed %>% 
+              select(country, year, Aquaculture_no_seaweed, Capture_no_seaweed, total_production_no_seaweed, prop_aqua_no_seaweed),
+            by = c("country", "year")) 
+```
+
+Get global map; join aquaculture proportion data from most recent year.
+```{r}
+world_map <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+world_map_data <- world_map %>% 
+  sf::st_transform(crs = "+proj=robin") %>% 
+  mutate(un_a3 = as.integer(un_a3)) %>% 
+  left_join(prop_aq %>% 
+              group_by(country) %>% 
+              arrange(desc(year)) %>% 
+              slice(1) %>% 
+              select(country, year, prop_aqua_incl_seaweed, prop_aqua_no_seaweed), by = c("un_a3" = "country"))
+```
+
+Define desired countries to highlight and then build world map, country time series, and stitch into multipanel plot.
+```{r}
+# Define countries and plot annotations
+countries <- world_map_data %>% 
+  filter(name %in% c("Chile", "Indonesia", "United States"))
+
+# Get position of countries for plot annotations
+country_pos <- sf::st_coordinates(sf::st_point_on_surface(countries)) %>% 
+  data.frame() %>% 
+  add_column(name = sf::st_point_on_surface(countries)$name) # Not sure why mutate() didn't work here
+
+# Download ocean bounding box and reproject
+bbox <- rnaturalearth::ne_download(scale = 110, type = "wgs84_bounding_box", category = "physical", returnclass = "sf")
+bbox <- st_transform(bbox, crs = "+proj=robin")
+```
+
+# Plot 
+
+The figure will include:
+
+1. Global chloropleth map depicting the proportion aquaculture contributes to total seafood production (*including aquatic plants*)
+2. Sample time series including one aquaculture-dominant country, one capture fisheries-dominant country, and one near the turnaround point.
+
+```{r}
+# Define color palette
+lemon_pal <- lacroix_palette("Lemon", type = "continuous", n = 10)
+scales::show_col(lemon_pal)
+
+# seed <- sample(1000:10000, 1)
+seed <- 6347
+
+# Build map plot
+(map_plot <- ggplot(data = world_map_data, aes(fill = prop_aqua_incl_seaweed)) +
+    geom_sf(data = bbox, fill = "aliceblue", color = NA) +
+    geom_sf(size = 0.2, color = "black") +
+    ggrepel::geom_text_repel(data = country_pos, inherit.aes = FALSE, aes(X, Y, label = name), 
+                             fontface = "bold", box.padding = 1.8, segment.size = 0.75, seed = seed) +
+    scale_fill_stepsn(colors = lemon_pal, n.breaks = 10, show.limits = TRUE) +
+    labs(fill = str_wrap("Aquaculture's proportion of total production", width = 30)) +
+    theme_void() +
+    theme(legend.position = "bottom",
+          legend.key.width = unit(2,"cm"))
+)
+
+
+# Build the three country time series as a list 
+(country_plots <- agg_production %>% 
+    filter(country %in% countries$un_a3) %>% 
+    filter(year >= 1980) %>% 
+    pivot_longer(starts_with("sum_quantity"), names_to = "tmp", values_to = "sum_quantity") %>% 
+    mutate(sector = case_when(str_detect(tmp, "no_seaweed") & sector == "Aquaculture" ~ "Aquaculture excl. seaweeds",
+                              str_detect(tmp, "no_seaweed") & sector == "Capture" ~ "Capture excl. seaweeds",
+                              TRUE ~ sector)) %>% 
+    select(-tmp) %>% 
+    filter(sector != "Capture excl. seaweeds") %>% # Take capture production excluding sw out of the plots
+    group_split(country) %>% 
+    map(~ggplot(., aes(x = year, y = sum_quantity/1e6, color = sector, linetype = sector)) +
+          geom_line(size = 0.75) +
+          scale_color_manual(values = c("Aquaculture" = lemon_pal[6],
+                                        "Aquaculture excl. seaweeds" = lemon_pal[6],
+                                        "Capture" = lemon_pal[10],
+                                        "Capture excl. seaweeds" = lemon_pal[10])) +
+          scale_linetype_manual(values = c("Aquaculture" = "solid",
+                                           "Aquaculture excl. seaweeds" = "dashed",
+                                           "Capture" = "solid",
+                                           "Capture excl. seaweeds" = "dashed")) +
+          labs(subtitle = .$country_name, 
+               x = "Year",
+               y = "Production (million tonnes)",
+               color = NULL,
+               linetype = NULL) +
+          ggpubr::theme_pubr() +
+          theme(legend.background = element_rect(fill = "transparent"),
+                axis.title.y = element_text(margin = margin(0, 0, 0, 25))) # Add space to make room for plot labels
+    )
+)
+
+# Stitch the country plots together and adjust axes titles
+
+one <- ggpubr::ggarrange(map_plot,
+                         labels = c("a")
+                         )
+
+two <- ggpubr::ggarrange((country_plots[[2]] + theme(axis.text.x = element_blank(),
+                                                     axis.title.x = element_blank(),
+                                                     axis.title.y = element_blank(),
+                                                     legend.position = c(0.42,0.75))),
+                         (country_plots[[1]] + theme(axis.text.x = element_blank(),
+                                                     axis.title.x = element_blank(),
+                                                     legend.position = "none")),
+                         (country_plots[[3]] + theme(axis.title.y = element_blank(),
+                                                     legend.position = "none")),
+                         labels = c("b", "c", "d"),
+                         ncol = 1,
+                         align = "hv"
+                        )
+
+ggpubr::ggarrange(one, two, nrow = 1, widths = c(1,0.4))
+
+```
+
+Save plot:
+```{r}
+ggsave(here::here("output", "figs", "fig1_ts_examples_with_map.pdf"), width = 180, height = 80, scale = 1.8, units = "mm", dpi = 600)
+```
+
+

@@ -1,0 +1,122 @@
+---
+title: "Tidy FAO Production data"
+author: "Danielle Ferraro, UC Santa Barbara"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+# Introduction
+
+This document describes the methods used to tidy FAO production data (capture and aquaculture) for use in Track 1 of the Brewfish project.
+
+The major operations performed on the data are:
+
+- Filter out quantities of taxa recorded as individuals (whales, crocodiles/alligators/seals)
+- Transform neglgibles
+- Add sector column
+- Add country metadata 
+- Clean column names
+
+**Input:** Raw FAO production - `TS_FI_PRODUCTION.csv`.  
+**Output:** Tidied FAO production - `fao_production_tidy.csv`.
+
+# Setup
+
+Install packages.
+```{r packages, message = FALSE}
+library(here)
+library(tidyverse)
+library(janitor)
+```
+
+Source scripts. 
+```{r scripts, eval = TRUE}
+source(here("src", "directories.R"))
+```
+
+# Import data
+
+```{r import-production-data, message = FALSE}
+# FAO Production 
+production <- read_csv(file.path(dir_raw_data, "FAO", "production", "TS_FI_PRODUCTION.csv"), 
+                       col_types = cols(UNIT = col_character())) %>% 
+  clean_names()
+# FAO country metadata
+country_key <- read_csv(file.path(dir_raw_data, "FAO", "production", "CL_FI_COUNTRY_GROUPS.csv")) %>% 
+  clean_names()
+# Master species key
+master_spp_key <- read_csv(file.path(dir_data_aquaculture, "keys", "master_species_key.csv"))
+```
+
+# Tidy data
+
+Append country names to production data. 
+
+```{r append-country-names}
+production <- production %>% 
+  left_join(country_key[,c("un_code", "name_en", "eco_class_group")], by = c("country" = "un_code")) %>% 
+  rename(country_name = name_en)
+```
+
+Evaluate symbols. According to the FAO metadata (also available on NCEAS' Aurora server at `r file.path(dir_raw_data, "FAO", "production", "CL_FI_SYMBOL.csv")`), the different characters in the `SYMBOL` column correspond to the following notes:
+
+Code|Symbol|Name|Description
+-----|-----|-----|-----
+1|.|UNKNOWN|Data not available; unobtainable; data not separately available but included in another category
+2|0|NEGLIGIBLE|More than zero but less than half the unit used
+3|-|ZERO|None; magnitude known to be nil or zero
+4|F|ESTIMATED|FAO estimate from available sources of information or calculation based on specific assumptions
+5|R|REPETITION|Repetition
+6| |OFFICIAL|Official Data
+
+```{r transform-symbols}
+table(production$symbol) # Need to transform the negligibles (symbol == "0") and zeroes (symbol == "-")
+production <- production %>% 
+  mutate(quantity = case_when(symbol=="0" ~ 0.5,
+                              symbol=="-" ~ 0,
+                              TRUE ~ quantity))
+```
+
+Identify aquaculture vs. capture landings. According to the FAO metadata (also available on NCEAS' Aurora server at `r file.path(dir_raw_data, "FAO", "production", "CL_FI_PRODUCTION_SOURCE.csv")`), the different numbers in the `SOURCE` column correspond to the following types of production:
+
+Identifier|Code|Name
+-----|-----|-----
+5|AQUACULTURE|Aquaculture production
+1|FRESHWATER|Aquaculture production (freshwater)
+2|BRACKISHWATER|Aquaculture production (brackishwater)
+3|MARINE|Aquaculture production (marine)
+4|CAPTURE|Capture production
+
+```{r define-sector}
+production <- production %>% 
+  mutate(sector = if_else(source==4, "Capture", "Aquaculture"))
+```
+
+Identify landings recorded as the number of individuals instead of tonnage. According to the FAO metadata (also available on NCEAS' Aurora server at `r file.path(dir_raw_data, "FAO", "production", "CL_FI_UNIT.csv")`), the different characters in the `UNIT` column correspond to the following units:
+
+Code|Name_En
+-----|-----
+n3|Quantity (number 1000)
+t|Quantity (tonnes)
+v|Value (USD 1000)
+no|Quantity (number)
+h|Effort (hours)
+kg|Quantity (kilograms)
+m|Length (meters)
+
+All landings are reported in metric tons, except for whales, seals, and crocodiles, which are reported in number of individuals. **Here those landings are removed.**
+
+```{r filter-individuals}
+production <- production %>% 
+  filter(unit != "no")
+```
+
+# Save
+
+```{r save}
+write_csv(production, file.path(dir_data_aquaculture, "fao_production_tidy.csv"))
+```
+

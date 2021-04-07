@@ -1,0 +1,2629 @@
+---
+title: "Has aquaculture influenced fisheries catch/n(Re-run of Longo et al 2019)"
+author: "Richard Cottrell"
+date: "10/03/2020"
+output: pdf_document
+---
+
+Libraries
+```{r packages, include=FALSE, eval=TRUE}
+#remotes::install_github("coolbutuseless/ggpattern") #required for the shading in the heatmap of figure 4
+
+library(broom)
+library(car)
+library(janitor)
+library(vroom)
+library(plm)
+library(MuMIn)
+library(zoo)
+library(data.table)
+library(here)
+library(ggfortify)
+library(tidyverse)
+library(ggpubr)
+library(ggeffects)
+library(countrycode)
+library(wbs)
+library(dotwhisker)
+library(lfe)
+library(survival)
+library(glmmTMB)
+library(patchwork)
+library(statmod)
+library(LaCroixColoR)
+library(grid)
+library(png)
+library(ggpattern)
+library(vegan)
+library(rgdal)
+library(AER) #IV Regression
+```
+
+
+Local functions unique to this markdown document
+
+```{r}
+
+z_scores <- function(x){
+  return((x-mean(x))/sd(x))
+}
+
+
+coeff_var <- function(x){
+  return(sd(x)/mean(x))
+}
+
+rolling_rate <- function(x,func, wide){
+  roll_rate <- rollapply(data = x,
+                         width = wide,
+                         FUN = func,
+                         fill=NA, align="right")
+  return(roll_rate)
+  
+}
+
+```
+
+
+Data sources 
+
+Code here outlines how we imported data on food production, upsides assessment database, shocks, collapses, trade, fish supply, GDP, age-dependency. Note the final panel data can be found at the KNB repository associated with this paper (https://dev.nceas.ucsb.edu/view/doi%3A10.5072%2FFK22230V7T). 
+
+```{r source data import}
+
+
+#characterised country statistics - see KNB repository for data file
+characterized_time_series <- read.csv(file.path(dir_data_aquaculture, "characterized_time_series.csv"))
+
+#FOOD PRODUCTION DATA - FAO
+
+#fisheries and aquaculture production - this is tidied data from FAO FishStatJ - see tidy_fao_production.rmd
+production_tidy <- read_csv(file.path(dir_data_aquaculture, "fao_production_tidy.csv")) %>% 
+  arrange(country_name, year, sector, species) %>% 
+  filter(country_name %in% characterized_time_series$country_name)
+
+
+production_tidy_2 <- read_csv(file.path(dir_data_aquaculture, "fao_production_tidy.csv")) %>% 
+  arrange(country_name, year, sector, species) 
+
+
+
+#fisheries diversity timeseries - see KNB repository
+fisheries_div <- read_csv(file.path(dir_data_aquaculture, "diversity_timeseries.csv")) %>% 
+  filter(sector=="Capture") %>% 
+  arrange(country_name, year) %>% 
+  mutate(country = as.numeric(country))
+
+
+
+#FOOD BALANCE - FAO - see tidy_food_balance_data.rmd for tidying process
+
+food_bal <- fread(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy.csv"), header = TRUE) %>% 
+  arrange(item, element, year)
+
+
+#NEW FOOD BALANCE DATA (updates after 2013)
+
+(new_food_bal <- fread(file.path(dir_raw_data, "FAO", "food_balance_new_methodology", "FoodBalanceSheets_E_All_Data_(Normalized).csv"), header = TRUE) %>% 
+    clean_names() %>% 
+    arrange(item, element, year) %>% 
+    rename(quantity = value) %>% 
+    select(area_code, area, item_code, item, element_code, element, unit, year, quantity)
+)
+
+#bind the two - after examination of joined data, the macro-trends are unaffected
+(total_food_bal <- bind_rows(food_bal, new_food_bal) %>% 
+  arrange(area, item, element, year) %>% 
+    filter(item!= "Alcohol, Non-Food")) 
+  
+
+
+#FISH SUPPLY - FAO
+
+fish_supply_caput <- total_food_bal %>% filter(element == "Food supply quantity (kg/capita/yr)" & item == "Fish, Seafood") %>% 
+  mutate(country_name=area,
+         country = countrycode(area, "country.name", "iso3n", warn=TRUE)) %>%
+  rename(fish_supply = quantity) %>% 
+  #mutate(country = as.character(country)) %>% 
+  select(country, country_name, year, fish_supply) %>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao People's Democratic Republic" ~ "Lao People's Dem. Rep." , 
+                                  country_name == "Swaziland" ~ "Eswatini",
+                                  
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name)) %>% 
+  drop_na(fish_supply) %>% 
+  filter(country_name != "China") #remove china total to allow for mainland and other administrative regions to be analysed separately. 
+
+
+
+
+#FISH/SEAFOOD TRADE
+
+
+#fish exports
+fish_exports <- total_food_bal %>% filter(element == "Export Quantity" & item == "Fish, Seafood") %>% 
+  mutate(country_name=area,
+         country = countrycode(area, "country.name", "iso3n", warn=TRUE)) %>%
+  mutate(exports = quantity*1000) %>% 
+  #mutate(country = as.character(country)) %>% 
+  select(country, country_name, year, exports) %>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao People's Democratic Republic" ~ "Lao People's Dem. Rep." , 
+                                  country_name == "Swaziland" ~ "Eswatini",
+                                  
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name)) %>% 
+  drop_na(exports) %>% 
+  filter(country_name != "China")
+
+
+fish_imports <- total_food_bal %>% filter(element == "Import Quantity" & item == "Fish, Seafood") %>% 
+  mutate(country_name=area,
+         country = countrycode(area, "country.name", "iso3n", warn=TRUE)) %>%
+  mutate(imports = quantity*1000) %>% 
+  mutate(country = as.character(country)) %>% 
+  select(country, country_name, year, imports) %>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao People's Democratic Republic" ~ "Lao People's Dem. Rep." , 
+                                  country_name == "Swaziland" ~ "Eswatini",
+                                  
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name)) %>% 
+  drop_na(imports) %>% 
+  filter(country_name != "China")
+
+
+
+
+
+#Shocks - import output of shock analysis (see KNB repository)
+
+(shocks_by_item_tally <- read_csv(file.path(dir_data_aquaculture, "shocks", "shocks_by_food_item_2020-03-03.csv")) %>% 
+    mutate(country = as.numeric(country)) %>% 
+    group_by(country, country_name, year) %>% 
+    summarise(no_shocks = sum(is_shock==TRUE)))
+
+
+
+
+
+#GDP 
+
+#FAO national GDP
+
+
+#constant FAO GDP per capita - this raw data imported from the FAO (substitute file path with that of downloaded data as needed)
+
+(gdp_fao_2 <-  vroom(file.path(dir_raw_data, "FAO", "GDP", "GDP_caput_2010_value.csv")) %>% 
+  rename(country_name= Area) %>% 
+  mutate(country_name =  case_when(grepl("d'Ivoire", country_name) ~ "Ivory Coast",
+                          grepl("Cura", country_name) ~ "Curacao",
+                          TRUE ~ country_name)) %>% 
+  mutate(country = countrycode(sourcevar = country_name, origin="country.name", destination = "iso3n", warn=TRUE)) %>% 
+    drop_na(country, Value) %>% 
+    rename(gdp=Value,
+           year=Year) %>%  
+  mutate(country = as.integer(country))%>%
+  select(country, country_name, year, gdp)
+  )
+
+
+#World bank GDP USD 2010 (not per capita - needs transformation with population data) - this is raw data from world bank, substitute file path as appropriate 
+(gdp_WB <- read_csv(file.path(dir_raw_data, "World_Bank", "GDP_2010_value.csv")) %>% 
+  rename(country_b= `Country Code`,
+         country_name = `Country Name`) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`)) %>% 
+  pivot_longer(names_to = "year", values_to = "gdp2", -c(country_name, country_b)) %>% 
+    mutate(country = countrycode(country_b, origin="iso3c", destination= "iso3n", warn=TRUE)) %>% 
+    mutate(year = as.numeric(year))%>%
+    mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao PDR" ~ "Lao People's Dem. Rep." , 
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name)) %>% 
+    select(-country_b)
+)
+
+
+
+#POPULATION
+
+
+#FAO population from food balance
+pop <- total_food_bal %>% filter(element=="Total Population - Both sexes") %>% 
+  mutate(country_name=area,
+         country = countrycode(area, "country.name", "iso3n", warn=TRUE),
+         quantity = quantity*1000) %>% 
+  rename(pop = quantity) %>% 
+  #mutate(country = as.character(country)) %>% 
+  select(country, country_name, year, pop) %>% 
+  filter(country_name %in% characterized_time_series$country_name) %>% 
+  mutate(country_name = case_when(country_name == "China, Taiwan Province of" ~ "Taiwan Province of China",
+                                  country_name == "Lao PDR" ~ "Lao People's Dem. Rep." , 
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~ "Viet Nam",
+                                  country_name == "Bolivia" ~ "Bolivia (Plurinat.State)",
+                                  country_name == "Iran (Islamic Republic of)" ~ "Iran (Islamic Rep. of)",
+                                  country_name == "Cote d'Ivoire" ~  "Côte d'Ivoire",
+                                  country_name == "Korea, Rep." ~ "Korea, Republic of",
+                                  country_name == "Macao SAR, China" ~ "China, Macao SAR",
+                                   country_name == "Micronesia" ~  "Micronesia, Fed.States of",
+                                  country_name == "Saint Vincent and the Grenadines" ~  "Saint Vincent/Grenadines",
+                                  TRUE ~ country_name))
+         
+
+#worldbank pop - this use raw data from world bank, substitute file path as appropriate
+
+
+pop_wb<- read_csv(file.path(dir_raw_data, "World_Bank", "pop_world_bank.csv")) %>% 
+  rename(country_name = `Country Name`,
+         country_b = `Country Code`) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`)) %>% 
+  gather(key = "year", value = "pop_2", -c(country_name, country_b)) %>% 
+  mutate(country = countrycode(country_b, origin="iso3c", destination= "iso3n", warn=TRUE)) %>% 
+  drop_na(country) %>% 
+  mutate(year = as.numeric(year))%>% 
+  select(country, country_name, year, pop_2) %>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao PDR" ~ "Lao People's Dem. Rep." , 
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  country_name == "Bolivia" ~ "Bolivia (Plurinat.State)",
+                                  country_name == "Bahamas, The" ~ "Bahamas",
+                                  country_name == "Congo, Rep." ~ "Congo",
+                                  country_name == "Congo, Dem. Rep." ~ "Congo, Dem. Rep. of the",
+                                  country_name == "Cote d'Ivoire" ~  "Côte d'Ivoire",
+                                  country_name == "Korea, Rep." ~ "Korea, Republic of",
+                                  country_name == "Gambia, The" ~"Gambia",
+                                  country_name== "Hong Kong SAR, China" ~ "China, Hong Kong SAR",
+                                  country_name == "Iran, Islamic Rep." ~ "Iran (Islamic Rep. of)",
+                                  country_name == "Micronesia, Fed. Sts." ~  "Micronesia, Fed.States of",
+                                  country_name == "St. Kitts and Nevis"  ~  "Saint Kitts and Nevis" ,
+                                  country_name == "St. Lucia"   ~ "Saint Lucia" ,
+                                  country_name == "St. Vincent and the Grenadines" ~ "Saint Vincent/Grenadines",
+                                  country_name ==  "Tanzania" ~ "Tanzania, United Rep. of",
+                                  country_name == "United States" ~ "United States of America",
+                                  country_name == "Virgin Islands (U.S.)" ~ "US Virgin Islands", 
+                                  country_name == "Venezuela, RB" ~ "Venezuela, Boliv Rep of",
+                                  country_name == "Yemen, Rep." ~ "Yemen",
+                                  TRUE ~ country_name))
+
+
+
+#world bank age-dependency ratio - this uses raw data from world bank, substitute raw data file path as appropriate
+age_depend <- read_csv(file.path(dir_raw_data, "World_Bank", "age_dependency_ratio.csv")) %>% 
+  rename(country_name = `Country Name`,
+         country = `Country Code`) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`)) %>% 
+  gather(key = "year", value = "a_d_ratio", -c(country_name, country)) %>% 
+  mutate(country = countrycode(country, origin="iso3c", destination= "iso3n", warn=TRUE)) %>% 
+  drop_na(country) %>% 
+  mutate(year = as.numeric(year))%>% 
+  select(country, country_name, year, a_d_ratio)%>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao PDR" ~ "Lao People's Dem. Rep." , 
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name))
+
+#world bank porp of people in urban areas
+urban_ratio <- read_csv(file.path(dir_raw_data, "World_Bank", "Prop_urban_population.csv")) %>% 
+  rename(country_name = `Country Name`,
+         country = `Country Code`) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`)) %>% 
+  gather(key = "year", value = "urbanization", -c(country_name, country)) %>% 
+  mutate(country = countrycode(country, origin="iso3c", destination= "iso3n", warn=TRUE)) %>% 
+  drop_na(country) %>% 
+  mutate(year = as.numeric(year))%>% 
+  select(country, country_name, year, urbanization)%>% 
+  mutate(country_name = case_when(country_name == "Egypt, Arab Rep." ~ "Egypt",
+                                  country_name == "Lao PDR" ~ "Lao People's Dem. Rep." , 
+                                  country == "408" ~ "Korea, Dem. People's Rep",
+                                  country_name =="Vietnam" ~"Viet Nam",
+                                  TRUE ~ country_name))
+
+
+
+unique(gdp_fao$element)
+```
+
+
+#Production filtered for countries with evidence for the 'blue-transition' for separate analysis
+
+Blue trabsition countries with seaweed included
+
+```{r}
+
+
+(blue_transition_countries <- 
+  production_tidy %>% 
+  group_by(country, country_name, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>%
+  filter(country_name %in% characterized_time_series$country_name)%>% 
+  group_by(country, country_name) %>% 
+  filter(year == max(year)) %>% 
+  spread(key=sector, value = quantity) %>% 
+  #drop_na(Aquaculture) %>%
+  filter(Aquaculture>Capture))
+
+unique(blue_transition_countries$country_name)
+
+(blue_transition_prod <- production_tidy %>% 
+  #group_by(country, country_name, sector, year) %>% 
+  #summarise(quantity = sum(quantity)) %>%
+  filter(country_name %in% blue_transition_countries$country_name) %>% 
+  group_by(species, country, country_name, year, sector) %>% 
+  summarise(quantity=sum(quantity)) %>% 
+  arrange(country_name, year))
+```
+  
+Supplementary figure on trajectory of fisheries landings of all aqua-dominant countries
+````{r}
+
+ggplot(data = blue_transition_prod %>% filter(sector=="Capture") %>% group_by(country_name, year) %>% summarise(quantity=sum(quantity)) %>% 
+         mutate(country_name = case_when(country_name=="Korea, Dem. People's Rep" ~ "DPRK", 
+                                         country_name == "Lao People's Dem. Rep." ~ "Laos",
+                                         TRUE ~ country_name)), 
+       aes(x=year, y=quantity))+
+  geom_point()+
+  theme(text = element_text(size=12))+
+  theme_bw()+
+  labs(y="Landings (tonnes)")+
+  facet_wrap(~country_name, scales = "free", ncol = 4, nrow = 7)+
+  geom_smooth(method="loess")+
+ggsave(here("explore", "cottrell_explore", "fisheries trajectory.tiff"), device = "tiff", dpi=300, width = 20, height = 25, units = "cm")+
+  ggsave(here("explore", "cottrell_explore", "fisheries trajectory.jpg"), device = "jpg", dpi=300, width = 20, height = 25, units = "cm")
+
+unique(blue_transition_prod$country_name)
+
+```
+
+Blue transition countries w/o seaweed
+
+```{r}
+
+seaweed_list <- as.character(expression(SWB, WAP, AJC, EEZ, UDS,UDP,ZFC,DOK,NYQ,YQT,IPD,IYJ,YKL,IYK,DVA,FUA, ASN, FUU,FDS, UCU, FCV,UCE,"FUV", FUP,ZSQ, HLZ, LAZ, LAH, LQD, LNJ,QYI,LQX,LXF,EOZ,LJZ, LJX,MXF,MXY,GQO,ZSD,ZSY,GQL,GQY,GQU,QVS,GQJ,GQK,RGV,GQB,QWX,UIO,UIC,UIU,YDL,PWF,SWR,HFH, HFJ, OFK,FRP,OFU,OFX,OFH,OFQ,PRT,FYS,PRH,OFN,YKN,GQX,GQR,ASR,JLM,BLX,KNW,KMK,KMX,KMN,KMD,KMJ,KMI,KMF,KMQ,KRQ,JNR,JNA,LHD,LJQ,LIT,FMK,YMD,YKP,KDL,SWQ,SWP,FKU,MZM,GJO,GEQ,GJC,GJP,GEW,GDK,GDX,GDH,GJJ,GDY,GEL,QTH,QTU,QTN,PKZ,OKQ,GHG,GJE,GJA,KDM,KDZ,KDI,KDW,IMS,GJK,IDC,LGY,MZL,SBQ,GCO,GKA,GKI,GCH,GKK,GKC,GCW,GJX,GJW,GLS,GZG,GKH,YNQ,YNF,YAH,YAK,YAY,YND,YEH,YAZ,YAD,YAX,YEB,KFF,KFV,NLO,RHP,MVT,MVQ, YGJ,YGF,YGN, GKF, YKE, YFQ, OKG, OTX,KHI, DMH, DGM,LVF,LVS,LVB,VLA,ISV, UKI,UKD,EMX,EMC,EMI,EMA,JZT,QVX,JZS,OIK, OKF,FCK,SWG,KQT,KQS,KQP,KQX,KQE,KQC,KQB,CAU,KQR,TZZ,KMW,KMH,KMY,KIR,KCG,KIY,KIL,KIB,KIE,KIQ,KJT,KIA,KII,UNJ,UNI,HZP,MTN,HLW,HQW,NHO,HMW,UEC,EFP,EBN,EBL,EBZ,EBP,EOW,UVU,UVI,UVQ,UVC,UVF,UVR, UYH,UVP))
+
+
+(blue_transition_countries_2 <- 
+  production_tidy %>% 
+  filter(!species %in% seaweed_list) %>% 
+  group_by(country, country_name, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>%
+  filter(country_name %in% characterized_time_series$country_name)%>% 
+  group_by(country, country_name) %>% 
+  filter(year == max(year)) %>% 
+  spread(key=sector, value = quantity) %>% 
+  #drop_na(Aquaculture) %>%
+  filter(Aquaculture>Capture))
+
+unique(blue_transition_countries_2$country_name)
+
+blue_transition_prod_2 <- production_tidy %>% 
+  filter(!species %in% seaweed_list) %>% 
+  #group_by(country, country_name, sector, year) %>% 
+  #summarise(quantity = sum(quantity)) %>%
+  filter(country_name %in% blue_transition_countries_2$country_name) %>% 
+  group_by(species, country, country_name, year, sector) %>% 
+  summarise(quantity=sum(quantity))
+  
+
+```
+
+#Adding covariates to production data - INLAND AND MARINE
+
+
+```{r, covariates, eval=TRUE}
+
+#wide format
+(production_wide <- production_tidy %>% 
+  group_by(country, country_name, sector, year, eco_class_group) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  spread(key=sector, value=quantity) %>% 
+  rename(aquaculture_prod = Aquaculture, capture_prod = Capture) %>% 
+  filter(year > 1969) %>% 
+   ungroup() %>% 
+  mutate(aquaculture_prod = case_when(is.na(aquaculture_prod) ~ 0,
+                                      TRUE ~ aquaculture_prod))
+  )
+
+#join covariate data
+(production_w_covariates <- production_wide %>% 
+    mutate(country = as.numeric(country)) %>% 
+    left_join(pop, by=c("country", "country_name", "year")) %>%  #population from fao
+    left_join(pop_wb, by=c("country", "country_name", "year")) %>%# population from world bank
+    mutate(pop_2 = case_when(is.na(pop_2) ~ pop,
+                             TRUE ~ pop_2),
+           pop = pop_2) %>%  #update world bank with fao for world bank missing countries and then use worldbank 
+    select(-pop_2) %>%
+    mutate(aqua_prod_caput = aquaculture_prod/pop,
+           capture_prod_caput = capture_prod/pop)%>% #per capita production  
+    left_join(fish_supply_caput[,-2], by=c("country", "year")) %>% #join fish supply 
+    drop_na(fish_supply) %>% #drop countries and time points where no fish supply exists - n = 55 states, nothing beyond 2013
+    left_join(fish_exports[,-2], by=c("country", "year")) %>%
+    mutate(exports = case_when(country_name=="Afghanistan" ~ 0,
+                               TRUE ~ exports)) %>% #AFghanistan has no export information - have made it all 0
+    mutate(exports_caput = exports/pop) %>% 
+    left_join(gdp_WB[,-1], by=c("country", "year")) %>% 
+    mutate(gdp2_caput = gdp2/pop) %>% 
+    left_join(gdp_fao_2[,-2], by=c("country", "year")) %>%  #W has better coverage for existing countries so use preferentially
+    mutate(gdp = if_else(is.na(gdp), true = gdp2_caput, false = gdp)) %>%  #use the world bank values for where fao has none
+    select(-c(gdp2_caput,gdp2)) %>%  #remove world bank gdp data
+    mutate(gdp2 = gdp^2) %>% 
+    drop_na(gdp2) %>% 
+    left_join(age_depend[,-2], by=c("country", "year")) %>% #Bermuda, Dominica, St Kitts and Nevis have no data on age depend.
+    drop_na(a_d_ratio) %>% 
+    left_join(urban_ratio[,-2], by=c("country", "year")) %>% #urban proportion data 
+    left_join(fisheries_div[, -c(2,4)], by = c("country", "year")) %>% 
+    group_by(country, country_name) %>% 
+    nest() %>% 
+    #mutate(rolling_div = map(data, ~(rolling_rate(x=.$invsimpson, func = coeff_var, wide = 10)))) %>% 
+    mutate(capture_CV = map(data, ~(rolling_rate(x=.$capture_prod, func = coeff_var, wide = 10)))) %>% 
+    unnest(c(data,capture_CV)) %>% #add capture coefficient of variation
+    ungroup() %>% 
+    left_join(shocks_by_item_tally[,-2], by=c("country", "year")) %>% #number of shocks in a given year
+    mutate(no_shocks = case_when(is.na(no_shocks) ~ 0,
+                                 TRUE ~ as.numeric(no_shocks)))%>% 
+    group_by(country, country_name) %>% 
+    nest() %>% 
+    mutate(cum_shocks = map(data, ~ (rolling_rate(x=.$no_shocks, func = sum, wide=10)))) %>% 
+    unnest(c(data, cum_shocks)) %>% 
+    ungroup() %>% 
+    filter(year>1979 & country_name!= "Belgium")
+) %>% 
+  write_csv(file.path(dir_data_aquaculture, "panel_regression_data_collapses_omitted.csv"))
+
+```
+
+#Plot the production of each country - INLAND AND MARINE
+
+```{r}
+
+
+production_w_covariates_long <- production_w_covariates %>% 
+  select(country_name, year, aqua_prod_caput, capture_prod_caput) %>% 
+  gather(key = "consumption", value="value", -c(country_name, year))
+
+
+production_covariate_list <- production_w_covariates_long %>% 
+  group_by(country_name) %>% group_split()
+
+# Build of list of production per capita time series plots by country
+collapse_production_plots <- map(production_covariate_list, 
+                            ~ggplot(., aes(x = year, y = value, color = consumption)) + 
+                              geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+                              geom_line() +
+                              geom_point() +
+                              scale_color_manual(values = c("darkred", "darkblue"), 
+                                                 labels = c("Aquaculture", "Capture")) +
+                              scale_x_continuous(breaks=seq(1950, 2017, 10)) +
+                              ylim(0,NA) +
+                              labs(title = paste("Fisheries Production in", .$country_name), 
+                                   x = "Year", 
+                                   y = "Production per capita",
+                                   color = NULL) +
+                              ggpubr::theme_pubr() +
+                              theme(legend.text = element_text(size=11))
+)
+
+
+pdf(here("explore", "cottrell_explore", "production_per_capita_INLAND_&_MARINE.pdf"), height = 11, width = 8.5) #shift location as needed
+ggpubr::ggarrange(plotlist = collapse_production_plots, nrow = 3, ncol = 1, align = "v")
+dev.off()
+
+
+
+
+
+#blue transition countries plot of production (can change between with and without algae countries - blue_transition_countries or blue_transition_countries_2 )
+
+
+#Aquaculture dominant with algae
+
+production_w_covariates_long <- production_w_covariates %>% 
+  filter(country_name %in% blue_transition_countries$country_name) %>% 
+  select(country_name, year, aqua_prod_caput, capture_prod_caput) %>% 
+  gather(key = "production", value="value", -c(country_name, year))
+
+
+production_covariate_list <- production_w_covariates_long %>% 
+  group_by(country_name) %>% group_split()
+
+
+# Build of list of production time series plots by country
+collapse_production_plots <- map(production_covariate_list, 
+                            ~ggplot(., aes(x = year, y = value, color = production)) + 
+                              geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+                              geom_line() +
+                              geom_point() +
+                              scale_color_manual(values = c("darkred", "darkblue"), 
+                                                 labels = c("Aquaculture", "Capture")) +
+                              scale_x_continuous(breaks=seq(1950, 2017, 10)) +
+                              ylim(0,NA) +
+                              labs(title = paste("Fisheries Production in", .$country_name), 
+                                   x = "Year", 
+                                   y = "Production (tonnes caput)",
+                                   color = NULL) +
+                              ggpubr::theme_pubr() +
+                              theme(legend.text = element_text(size=11))
+)
+
+
+pdf(here("explore", "cottrell_explore", "production-bluetransition_with_algae.pdf"), height = 11, width = 8.5)
+ggpubr::ggarrange(plotlist = collapse_production_plots, nrow = 3, ncol = 1, align = "v")
+dev.off()
+
+
+#Aquaculture dominant without algae
+
+production_w_covariates_long <- production_w_covariates %>% 
+  filter(country_name %in% blue_transition_countries_2$country_name) %>% 
+  select(country_name, year, aqua_prod_caput, capture_prod_caput) %>% 
+  gather(key = "production", value="value", -c(country_name, year))
+
+
+production_covariate_list <- production_w_covariates_long %>% 
+  group_by(country_name) %>% group_split()
+
+
+# Build of list of production time series plots by country
+collapse_production_plots <- map(production_covariate_list, 
+                            ~ggplot(., aes(x = year, y = value, color = production)) + 
+                              geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+                              geom_line() +
+                              geom_point() +
+                              scale_color_manual(values = c("darkred", "darkblue"), 
+                                                 labels = c("Aquaculture", "Capture")) +
+                              scale_x_continuous(breaks=seq(1950, 2017, 10)) +
+                              ylim(0,NA) +
+                              labs(title = paste("Fisheries Production in", .$country_name), 
+                                   x = "Year", 
+                                   y = "Production (tonnes caput)",
+                                   color = NULL) +
+                              ggpubr::theme_pubr() +
+                              theme(legend.text = element_text(size=11))
+)
+
+
+pdf(here("explore", "cottrell_explore", "production-bluetransition_wo_algae.pdf"), height = 11, width = 8.5)
+ggpubr::ggarrange(plotlist = collapse_production_plots, nrow = 3, ncol = 1, align = "v")
+dev.off()
+
+
+
+
+```
+
+#Generate balanced data -INLAND AND MARINE
+
+Note panel regression data can be imported from (https://dev.nceas.ucsb.edu/view/doi%3A10.5072%2FFK22230V7T) 
+
+
+```{r}
+
+production_w_covariates <- read_csv(file.path(dir_data_aquaculture, "panel_regression_data_collapses_omitted.csv")) 
+
+#omit countries where data is not available for whole time period
+(unbalanced_countries <-   names(which(table(production_w_covariates$country_name)!=38)))
+
+#also remove countries where data is absent (aquaculture) or looks unreliable. Countries with no aquaculture production for 50% or more of times series were removed. Eswatini also because of step change data
+
+(no_prod_countries <- production_w_covariates %>% group_by(country_name) %>% summarise(tally_0 = sum(aquaculture_prod==0)) %>% filter(tally_0 >= 19) %>% 
+  .$country_name %>% unique())
+
+bal_dat <- production_w_covariates %>% filter(!country_name %in% c(unbalanced_countries, no_prod_countries)) %>% 
+  mutate(aqua_prod_caput_kg = aqua_prod_caput*1000,capture_prod_caput_kg = capture_prod_caput*1000, exports_caput_kg = exports_caput*1000)
+
+length(unique(bal_dat$country_name))
+bal_dat %>% filter(!complete.cases(.))# All have complete data
+
+#how many countries report both sectors in 2017
+coproducers <- unique(production_tidy %>% 
+  group_by(country, country_name, sector, year, eco_class_group) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  spread(key=sector, value=quantity) %>% 
+  rename(aquaculture_prod = Aquaculture, capture_prod = Capture) %>% 
+  filter(year > 1969) %>% 
+   ungroup() %>% 
+  mutate(aquaculture_prod = case_when(is.na(aquaculture_prod) ~ 0,
+                                      TRUE ~ aquaculture_prod)) %>% 
+  filter(year ==2017 & aquaculture_prod>0 & capture_prod >0) %>% 
+  .$country_name)
+
+
+unique(production_w_covariates$country_name)
+
+
+```
+
+
+#Regression model - INLAND AND MARINE
+
+All countries (restrained to full time series 1980 -2017)
+
+#Regression with LM to allow for model selection (AIC) 
+
+Modelling procedure for all countries - FISHERIES marine and inland
+```{r run-full-log-log-lm-model}
+
+
+#start with log log model
+
+min_val<-min(bal_dat$capture_prod_caput)
+#min_val<-min(blue_prod_w_covariates$capture_prod_caput) 
+min_val
+
+#FISHERIES
+#check for normality
+length(which(bal_dat$capture_prod_caput==0)) #none with zeros
+length(which(bal_dat$aqua_prod_caput==0)) #232 with zeros
+
+hist(bal_dat$capture_prod_caput) #heavily right skewed data
+hist(log(bal_dat$capture_prod_caput+min_val)) #looks normal - so log transfromation appropriate for linear regression
+
+
+#Fit a staurated model - have removed simpsons, and collapses (marine only)
+LN_bal_model_sat_fixed_fish_lm <- lm(data = bal_dat, formula = log(capture_prod_caput+min_val) ~ log(aqua_prod_caput+min_val) + log(fish_supply+min_val) + log(exports_caput+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) + log(urbanization+min_val) + log(cum_shocks+min_val) + log(capture_CV+min_val)+ factor(country) + factor(year), na.action = "na.fail")
+
+
+summary(LN_bal_model_sat_fixed_fish_lm) #full log-log
+
+#model assumptions - residuals are leptokurtic, more centred around the mean than expected but no issues. Residuals also appear homoscedastic with no worrying temporal trends - all seems reasonable for linear model fit
+hist(residuals(LN_bal_model_sat_fixed_fish_lm))
+plot(residuals(LN_bal_model_sat_fixed_fish_lm), type="l")
+plot(LN_bal_model_sat_fixed_fish_lm) #n
+
+
+#collinearity assessment - VAriance inflation factors above 10 indicate collinearity (conservative measure). All five or under so seems reasonable
+vif(LN_bal_model_sat_fixed_fish_lm)
+
+
+#all possible subset model selection - retain all variables
+
+model_selection_fish_full <- dredge(LN_bal_model_sat_fixed_fish_lm)
+
+summary(LN_bal_model_sat_fixed_fish_lm)
+ncvTest(LN_bal_model_sat_fixed_fish_lm) #Breusch Pagan test reveals some uncertainty over error variance but nothing too worrying
+
+
+# Try Gamma GLM model
+
+hist(bal_dat$capture_prod_caput) #seems reasonable for the gamma distribution
+
+full_mod_fish_1a <- glm(data = bal_dat , formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp + gdp2 + a_d_ratio + urbanization + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(full_mod_fish_1a)
+
+vif(full_mod_fish_1a)
+
+full_mod_fish_2 <- glm(data = bal_dat , formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg  + gdp2 + a_d_ratio + urbanization + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+#check assumptions
+plot(full_mod_fish_2) # residuals look normal albeit a bit of skew for large fitted values
+
+
+#check variance inflation factors
+vif(full_mod_fish_2)
+
+
+#remove urbanisation?
+full_mod_fish_3 <- glm(data = bal_dat, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+
+summary(full_mod_fish_3) 
+
+#check collinearity again - all under 5
+vif(full_mod_fish_3)
+
+#check removing urbanisation is more parsimonious - AIC is minimised by urbanisation removed
+AIC(full_mod_fish_2, full_mod_fish_3) 
+
+#all possible subset model selection - remove cum shocks & aquaculture
+model_select_1 <- dredge(full_mod_fish_3, trace = TRUE)
+
+full_mod_fish_4 <-  glm(data = bal_dat, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg+ fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(full_mod_fish_4)
+
+#try specifying a different link function
+
+full_mod_fish_5 <-  glm(data = bal_dat, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg+ fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + capture_CV + factor(country) + factor(year), family = Gamma(link = "inverse"), na.action = "na.fail")
+
+summary(full_mod_fish_5) #changes some of the coefficients
+
+AIC(full_mod_fish_4, full_mod_fish_5) #log link function much better
+
+
+#relevel best model to use China as reference
+full_mod_fish_4b <-  glm(data = bal_dat %>% mutate(country = factor(country)) %>% mutate(country = relevel(country, ref=21)) %>% filter(), formula = capture_prod_caput_kg ~  fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+full_mod_fish_4b_plot <-  glm(data = bal_dat %>% mutate(country = factor(country)) %>% mutate(country = relevel(country, ref=21)) %>% filter(), formula = capture_prod_caput_kg ~ aqua_prod_caput_kg+ fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail") #this model version is used in the figure 2 plot to compare aquaculture coefficients. The rest of the outputs are based on the model without aquacultur eincluded
+
+summary(full_mod_fish_4b)
+
+```
+
+
+Re-run  model for aquaculture-dominant countries with algae included - marine and inland
+```{r run-blue-transition-log-log-lm-model}
+
+#Filter balanced data for blue trabsition countries
+blue_prod_w_covariates <- bal_dat %>% 
+  filter(country_name %in% blue_transition_countries$country_name)
+
+blue_prod_w_covariates_2 <- bal_dat %>% 
+  filter(country_name %in% blue_transition_countries_2$country_name)
+
+unique(blue_prod_w_covariates$country_name)
+unique(blue_prod_w_covariates_2$country_name)
+
+
+(min_val <- min(blue_prod_w_covariates$capture_prod))
+
+hist(blue_prod_w_covariates$capture_prod) #right skewed
+hist(log(blue_prod_w_covariates$capture_prod_caput)) # doesn't looks great logged but might be ok
+
+#log-log model first again
+
+BT_mod_fish_1 <- lm(data = blue_prod_w_covariates, formula = log(capture_prod_caput_kg+min_val) ~ log(aqua_prod_caput_kg+min_val) + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) +log(urbanization+min_val)  + log(cum_shocks+min_val) + log(capture_CV+min_val) + factor(country_name) +factor(year), na.action = "na.fail")
+
+plot(BT_mod_fish_1) #weird patterns in residuals - try GLM
+summary(BT_mod_fish_1)
+hist(residuals(BT_mod_fish_1))
+
+BT_mod_fish_2 <- glm(data = blue_prod_w_covariates, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio + urbanization + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_2)
+
+#check model assumptions - seems reasonable
+hist(residuals(BT_mod_fish_2))
+plot(residuals(BT_mod_fish_2))
+plot(BT_mod_fish_2)
+
+#partial residual plots
+termplot(BT_mod_fish_2,se=T,partial.resid=T,
+cex=0.6)
+
+#check for collinearity - remove urbanisation
+vif(BT_mod_fish_2)
+
+BT_mod_fish_3 <- glm(data = blue_prod_w_covariates, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio + cum_shocks +  capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_3)
+
+AIC(BT_mod_fish_2, BT_mod_fish_3) #parsimony is slightly stronger with urbanization but the collinearity raises flags
+
+
+#all possible subset model selection 
+model_select_2 <- dredge(BT_mod_fish_3, trace = TRUE) #remove shocks and CV
+
+BT_mod_fish_4 <- glm(data = blue_prod_w_covariates, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_4)
+
+plot(BT_mod_fish_4)
+plot(blue_prod_w_covariates$capture_prod_caput_kg, BT_mod_fish_4$fitted.values) #some weird outliers - identify which country
+identify(blue_prod_w_covariates$capture_prod_caput_kg, BT_mod_fish_4$fitted.values, labels= blue_prod_w_covariates$country_name)
+
+blue_prod_w_covariates[327,] #Cyprus is the outlier country - the weird spike an crash in fisheries may be distorting the fitted values
+
+
+#relevel for China but exclude cyprus
+
+BT_mod_fish_4b <- glm(data = blue_prod_w_covariates %>% filter(country_name != "Cyprus")  %>% mutate(country = factor(country)) %>% mutate(country = relevel(country, ref=6)) , formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_4b)
+
+
+plot(blue_prod_w_covariates %>% filter(country_name!="Cyprus") %>%  .$capture_prod_caput, BT_mod_fish_4b$fitted.values) #definitely improves predictive power
+abline(0,1)
+
+plot(BT_mod_fish_4b)
+
+
+```
+
+Re-run  model for aquaculture dominant countries without algae - marine and inland
+```{r}
+
+
+hist(blue_prod_w_covariates_2$capture_prod_caput)
+
+BT_mod_fish_5 <- glm(data = blue_prod_w_covariates_2, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio + urbanization + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_5)
+
+#check assumptions
+hist(residuals(BT_mod_fish_5))
+plot(residuals(BT_mod_fish_5))
+
+plot(BT_mod_fish_5)
+
+#check collinearity
+
+vif(BT_mod_fish_5) #remove urbanisation again
+
+BT_mod_fish_6 <- glm(data = blue_prod_w_covariates_2, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio + cum_shocks + capture_CV + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_6)
+
+#all possible subset model selection
+model_select_3 <- dredge(BT_mod_fish_6) # remove  capture CV and shocks
+
+
+BT_mod_fish_7 <- glm(data = blue_prod_w_covariates_2, formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio + factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+plot(BT_mod_fish_7)
+
+#check predictive power
+plot(blue_prod_w_covariates_2  %>%.$capture_prod_caput_kg, BT_mod_fish_7$fitted.values) #definitely improves predictive power
+abline(0,1)
+
+
+
+#Relevel for China and remove Cyprus again
+BT_mod_fish_8 <- glm(data = blue_prod_w_covariates_2 %>% filter(!country_name %in% c("Cyprus")) %>%  mutate(country = factor(country)) %>% mutate(country = relevel(country, ref=5)), formula = capture_prod_caput_kg ~ aqua_prod_caput_kg + fish_supply + exports_caput_kg + gdp2 + a_d_ratio +  factor(country) + factor(year), family = Gamma(link = "log"), na.action = "na.fail")
+
+summary(BT_mod_fish_8)
+
+plot(blue_prod_w_covariates_2 %>% filter(!country_name %in% c("Cyprus")) %>%.$capture_prod_caput_kg , BT_mod_fish_8$fitted.values) #definitely improves predictive power
+abline(0,1)
+
+AIC(BT_mod_fish_7,BT_mod_fish_8) #without Cyprus it is definitely improved
+
+
+```
+
+Plot model diagnostics for supplementary figures
+```{r}
+
+(full_response <- ggplot(data=bal_dat, aes(x=capture_prod_caput_kg))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[1], colour="grey40", binwidth = 180)+theme_pubr()+
+   scale_y_continuous(expand = c(0,0))+theme(axis.title = element_blank(),
+                                             axis.text.x = element_text(angle = 45, hjust = 1),
+                                             text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+   labs(subtitle = "All-producing countries"))
+(ADIS <- ggplot(data=blue_prod_w_covariates, aes(x=capture_prod_caput_kg))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[4], colour="grey40")+theme_pubr()+scale_y_continuous(expand = c(0,0))+theme(axis.title = element_blank(),
+                                             axis.text.x = element_text(angle = 45, hjust = 1),
+                                             text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+    labs(subtitle = "Aquaculture-dominant\n(including seaweeds)"))
+(ADES <- ggplot(data=blue_prod_w_covariates_2, aes(x=capture_prod_caput_kg))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[6], colour="grey40")+theme_pubr()+scale_y_continuous(expand = c(0,0))+theme(axis.title = element_blank(),
+                                             axis.text.x = element_text(angle = 45, hjust = 1),
+                                             text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+    labs(subtitle = "Aquaculture-dominant\n(excluding seaweeds)"))
+
+
+annotate_figure(ggarrange(full_response, ADIS, ADES, 
+          nrow = 1,
+          ncol = 3, 
+          labels = letters[1:3],
+          font.label = list(size=12),
+          label.x = -0.05),
+bottom = text_grob(label="Fisheries landings (kg per capita)"),
+left = text_grob(label = "Frequency", rot = 90))+
+  ggsave(here("explore", "cottrell_explore", "Supplementary Figure - Response distribution.jpg"), device = "jpg", dpi=300, width = 18, height = 9, units = "cm")
+
+
+
+#model diagnostics for All producing countries
+
+tibble(residuals= resid(full_mod_fish_4b))
+
+
+
+(full_hist_residuals <- ggplot(data=tibble(residuals= resid(full_mod_fish_4b)), aes(x=residuals))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[1], colour="grey40")+theme_pubr()+
+   scale_y_continuous(expand = c(0,0))+theme(text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+  labs(y="", x="",subtitle = "All-producing countries"))
+
+(adis_hist_residuals <- ggplot(data=tibble(residuals= resid(BT_mod_fish_4b)), aes(x=residuals))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[4], colour="grey40")+theme_pubr()+
+   scale_y_continuous(expand = c(0,0))+theme(text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+  labs(y="", x="",subtitle = "Aquaculture-dominant\n(including seaweeds)"))
+
+(ades_hist_residuals <- ggplot(data=tibble(residuals= resid(BT_mod_fish_8)), aes(x=residuals))+geom_histogram(fill=lacroix_palette("Lemon", n=6)[6], colour="grey40")+theme_pubr()+
+   scale_y_continuous(expand = c(0,0))+theme(text = element_text(size=12),
+                                             plot.subtitle = element_text(size=8))+
+  labs(y="", x="",subtitle = "Aquaculture-dominant\n(excluding seaweeds)"))
+
+
+annotate_figure(ggarrange(full_hist_residuals, adis_hist_residuals, ades_hist_residuals, 
+          nrow = 1,
+          ncol = 3, 
+          labels = letters[1:3],
+          font.label = list(size=12),
+          label.x = -0.05),
+bottom = text_grob(label="Model residuals "),
+left = text_grob(label = "Frequency", rot = 90))+
+  ggsave(here("explore", "cottrell_explore", "Supplementary Figure - Residual distribution.jpg"), device = "jpg", dpi=300, width = 18, height = 9, units = "cm")
+
+
+full_mod_diag <- autoplot(full_mod_fish_4b, which=c(1,2,3,6))+theme_pubr()+theme(text = element_text(size = 10))
+ggsave(grid.draw(gridExtra::arrangeGrob(grobs = full_mod_diag@plots)), file=here("explore", "cottrell_explore", "Supplementary figure - full_model_diagnostics.jpg"), h=10, w=18, units="cm",dpi=300)
+
+adis_mod_diag <- autoplot(BT_mod_fish_4b, which=c(1,2,3,6))+theme_pubr()+theme(text = element_text(size = 10))
+ggsave(grid.draw(gridExtra::arrangeGrob(grobs = adis_mod_diag@plots)), file=here("explore", "cottrell_explore", "Supplementary figure - adis_model_diagnostics.jpg"), h=10, w=18, units="cm",dpi=300)
+
+ades_mod_diag <- autoplot(BT_mod_fish_8, which=c(1,2,3,6))+theme_pubr()+theme(text = element_text(size = 10))
+ggsave(grid.draw(gridExtra::arrangeGrob(grobs = ades_mod_diag@plots)), file=here("explore", "cottrell_explore", "Supplementary figure - ades_model_diagnostics.jpg"), h=10, w=18, units="cm",dpi=300)
+
+
+#Predicted versus fitted values
+
+full_predict <- ggplot(tibble(Observed = bal_dat %>%.$capture_prod_caput_kg , Fitted = full_mod_fish_4b$fitted.values),
+       aes(x=Observed, y=Fitted))+geom_point(size=0.8)+geom_abline(intercept = 0, slope = 1, colour = lacroix_palette("Lemon", n=6)[1])+theme_pubr()+geom_vline(xintercept = quantile(bal_dat$capture_prod_caput_kg,0.99), linetype=2, colour="red")+
+  labs(y="", x="",subtitle = "All-producing countries")+theme(text = element_text(size=12),
+                                                              axis.text.x = element_text(angle=45, hjust=1),
+                                                              plot.margin = unit(c(t=0, r=0.2, b=0.0, l=0), units = "cm"),
+                                             plot.subtitle = element_text(size=8))
+
+adis_predict <- ggplot(tibble(Observed = blue_prod_w_covariates%>% filter(!country_name %in% c("Cyprus")) %>%.$capture_prod_caput_kg , Fitted = BT_mod_fish_4b$fitted.values),
+       aes(x=Observed, y=Fitted))+geom_point(size=0.8)+geom_abline(intercept = 0, slope = 1, colour=lacroix_palette("Lemon", n=6)[4])+theme_pubr()+geom_vline(xintercept = quantile(blue_prod_w_covariates$capture_prod_caput_kg,0.99), linetype=2, colour="red")+
+  labs(y="", x="",subtitle = "Aquaculture-dominant\n(including seaweeds)")+theme(text = element_text(size=12),
+                                                                                 axis.text.x = element_text(angle=45, hjust=1),
+                                                                                 plot.margin = unit(c(t=0, r=0.2, b=0.3, l=0), units = "cm"),
+                                             plot.subtitle = element_text(size=8))
+
+ades_predict <- ggplot(tibble(Observed = blue_prod_w_covariates_2 %>% filter(!country_name %in% c("Cyprus")) %>%.$capture_prod_caput_kg , Fitted = BT_mod_fish_8$fitted.values),
+       aes(x=Observed, y=Fitted))+geom_point(size=0.8)+geom_abline(intercept = 0, slope = 1, colour= lacroix_palette("Lemon", n=6)[6])+theme_pubr()+ geom_vline(xintercept = quantile(blue_prod_w_covariates_2$capture_prod_caput_kg,0.99), linetype=2, colour="red")+
+  labs(y="", x="",subtitle = "Aquaculture-dominant\n(excluding seaweeds)")+theme(text = element_text(size=12),
+                                                                                 axis.text.x = element_text(angle=45, hjust=1),
+                                                                                 plot.margin = unit(c(t=0, r=0.2, b=0.3, l=0), units = "cm"),
+                                             plot.subtitle = element_text(size=8))
+
+
+
+annotate_figure(ggarrange(full_predict, adis_predict, ades_predict,
+          nrow = 1,
+          ncol = 3, 
+          labels = letters[1:3],
+          font.label = list(size=12),
+          label.x = -0),
+bottom = text_grob(label="Observed values"),
+left = text_grob(label = "Fitted values", rot = 90))+
+  ggsave(here("explore", "cottrell_explore", "Supplementary Figure - Predictive power.jpg"), device = "jpg", dpi=300, width = 18, height = 8, units = "cm")
+```
+
+
+Save tidied lm model coefficients of both models (full and blue transition only) for both runs (fisheries as response, aq as response).
+```{r save-log-log-lm-model-coeffs}
+
+#summarises the models used to acquire the degrees of freedom
+
+#Summaries of fisheries models
+summary(full_mod_fish_4b) #all countries included
+summary(BT_mod_fish_4b)# aqua-dominant countries with algae included
+summary(BT_mod_fish_8) #aqua-dominant countries without algae included
+
+
+(combined_models_fisheries_2 <- 
+  bind_rows(
+  full_model_fisheries <- tidy(full_mod_fish_4b) %>% 
+    slice(2:7) %>% 
+    mutate(model = "All countries"),
+  
+  bt_model_fisheries <- tidy(BT_mod_fish_4b) %>% 
+    slice(2:6) %>%
+           mutate(model = "Aquaculture-dominant (incl. seaweeds)"),
+  
+  bt_model_fisheries_2 <- tidy(BT_mod_fish_8) %>% 
+    slice(2:5) %>% 
+    mutate(model = "Aquaculture-dominant (excl. seaweeds")
+  
+)) %>% 
+  write_csv(file.path(dir_data_aquaculture, "panel_regression_results", "fisheries_glm_model_results.csv"))
+
+
+# 
+# (combined_models_aq_2 <- 
+#   bind_rows(
+#   full_model_aq <- tidy(aqua_blue_bal_model_reduced_fixed_3) %>%
+#     slice(2:8) %>% 
+#     mutate(CI_95 = abs(qt(0.025, aqua_blue_bal_model_reduced_fixed_3$df.residual)*std.error),
+#            model = "BT countries incl. seaweeds"),
+#   
+#   bt_model_aq <- tidy(aqua_blue_no_alg_bal_model_reduced_fixed_3) %>% 
+#     slice(2:8) %>% 
+#     mutate(CI_95 = abs(qt(0.025, aqua_blue_no_alg_bal_model_reduced_fixed_3$df.residual)*std.error),
+#            model = "BT countries excl. seaweeds")
+# )) %>% 
+#   write_csv(file.path(dir_data_aquaculture, "panel_regression_results", "aq_lm_model_results.csv"))
+
+
+```
+
+#PLOT MARGINAL EFFECTS FROM EXPLANATORY VARIABLES
+
+
+#import image symbols   
+```{r}
+
+#image symbols
+
+aqua_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "Aquapen.png"))
+aqua_png <- rasterGrob(aqua_png)
+
+supply_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "fish supply.png"))
+supply_png <- rasterGrob(supply_png)
+
+exports_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "fish export.png"))
+exports_png <- rasterGrob(exports_png)
+
+gdp_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "dollar.png"))
+gdp_png <- rasterGrob(gdp_png)
+
+ad_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "age depend.png"))
+ad_png <- rasterGrob(ad_png)
+
+cv_png <- readPNG(here("explore", "cottrell_explore", "PNGs", "chart.png"))
+cv_png <- rasterGrob(cv_png)
+
+fishing_png  <- readPNG(here("explore", "cottrell_explore", "PNGs", "fishingboat.png"))
+fishing_png <- rasterGrob(fishing_png)
+
+```
+
+#plot marginal effects
+```{r}
+#Full model
+
+summary(full_mod_fish_4b_plot) #Variables of note are aquaculture, fish supply, exports, gdp, ad ratio, and capture CV
+
+#aquaculture
+(aqua_predict_full <- ggpredict(full_mod_fish_4b_plot, c("aqua_prod_caput_kg"))
+)
+(aqua_plot_full <- ggplot(data = aqua_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1, linetype=2, alpha=0.4)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Aquaculture~prod.~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,9), breaks = c(0,2,4,6,8))+
+    scale_x_continuous(breaks = c(0,50,100,150,200,250))+
+    coord_cartesian(clip="off")+
+    annotation_custom(aqua_png, xmin = 0, xmax = 60, ymin = 0, ymax = 3)+
+    geom_text(x=0, y=8, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b_plot))["aqua_prod_caput_kg", "t value"], digits = 3),",", "p=",round(coef(summary(full_mod_fish_4b_plot))["aqua_prod_caput_kg", "Pr(>|t|)"], digits = 3)))
+
+)
+
+
+#fish supply
+
+max(production_w_covariates$fish_supply) #large values come out of maldives for example
+
+
+fish_supply_predict_full <- ggpredict(full_mod_fish_4b, c("fish_supply"))
+
+(fish_supply_plot_full <- ggplot(data = fish_supply_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~supply~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0, 150), breaks = c(0, 30, 60, 90, 120, 150))+
+    annotation_custom(supply_png, xmin = 0, xmax = 20, ymin = 100, ymax=165)+
+    geom_text(x=0, y=100, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b))["fish_supply", "t value"], digits = 3),",", "p<0.001"))
+)
+
+#fish exports
+exports_predict_full <- ggpredict(full_mod_fish_4b, c("exports_caput_kg"))
+
+(exports_plot_full <- ggplot(data = exports_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+   theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~exports~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number())+
+    annotation_custom(exports_png, xmin = 0, xmax = 1800, ymin = 160, ymax=200)+
+    geom_text(x=0, y=130, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b))["exports_caput_kg", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+#gdp^2
+gdp_predict_full <- ggpredict(full_mod_fish_4b, c("gdp2"))
+
+  (gdp_plot_full <- ggplot(data = gdp_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+   theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(GDP~per~capita^2~("USD $ 2010,"~x10^9)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,6), breaks = c(0,1.5,3,4.5,6))+
+      scale_x_continuous(breaks = c(0,2e+9,4e+9,6e+9,8e+9,10e+9,12e+9), labels = c(0,2,4,6,8,10,12))+
+      annotation_custom(gdp_png, xmin = 0, xmax = 1.5e+9, ymin = 0, ymax=1.8)+
+    geom_text(x=5e+9, y=0.5, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b_plot))["gdp2", "t value"], digits = 3),",", "p=",round(coef(summary(full_mod_fish_4b))["gdp2", "Pr(>|t|)"], digits = 3)))
+)
+
+
+
+#Age-dependency ratio
+ad_predict_full <- ggpredict(full_mod_fish_4b, c("a_d_ratio"))
+
+(ad_plot_full <- ggplot(data = ad_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Age-dependency~ratio))+
+    scale_y_continuous(labels = scales::label_number(), limits=c(0,12))+
+    scale_x_continuous(limits = c(22,125), breaks = c(25, 50, 75, 100, 125))+
+    annotation_custom(ad_png, xmin = 20, xmax = 35, ymin = 0, ymax=3)+
+    geom_text(x=65, y=11.8, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b))["a_d_ratio", "t value"], digits = 3),",", "p<0.001"))
+
+)
+
+
+#Capture CV 
+CV_predict_full <- ggpredict(full_mod_fish_4b, c("capture_CV"))
+
+(CV_plot_full <- ggplot(data = CV_predict_full, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[1], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Lagged~CV~'for'~fisheries~landings))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,13), breaks = c(0,2.5,5,7.5,10,12.5))+
+  annotation_custom(cv_png, xmin = -0.5, xmax = 1, ymin = 8, ymax=13)+
+    geom_text(x=0, y=1, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(full_mod_fish_4b))["capture_CV", "t value"], digits = 3),",", "p<0.001"))
+
+)
+
+
+#==========================
+
+
+#BT MODEL WITH ALGAE
+
+summary(BT_mod_fish_4b) #Variables of note are aquaculture, fish supply, exports, gdp, ad ratio
+
+#aquaculture
+aqua_predict_BT <- ggpredict(BT_mod_fish_4b, c("aqua_prod_caput_kg"))
+
+(aqua_plot_BT <- ggplot(data = aqua_predict_BT, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[4], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+  theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Aquaculture~prod.~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits=c(0,10))+
+  annotation_custom(aqua_png, xmin = -0.30, xmax = 15, ymin = 0, ymax = 3.6)+
+    geom_text(x=30, y=9.8, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_4b))["aqua_prod_caput_kg", "t value"], digits = 3),",", "p=",round(coef(summary(BT_mod_fish_4b))["aqua_prod_caput_kg", "Pr(>|t|)"], digits = 3)))
+)
+
+
+fish_supply_predict_BT <- ggpredict(BT_mod_fish_4b, c("fish_supply"))
+
+(fish_supply_plot_BT <- ggplot(data = fish_supply_predict_BT, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[4], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~supply~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number())+
+  annotation_custom(supply_png, xmin = -5, xmax = 18, ymin = 76, ymax=100)+
+    geom_text(x=0, y=68, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_4b))["fish_supply", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+#fish exports
+exports_predict_BT <- ggpredict(BT_mod_fish_4b, c("exports_caput_kg"))
+
+(exports_plot_BT <- ggplot(data = exports_predict_BT, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[4], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~exports~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,30))+
+  annotation_custom(exports_png, xmin = 0, xmax = 8, ymin = 22, ymax=32)+
+    geom_text(x=0, y=20, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_4b))["exports_caput_kg", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+#gdp^2
+gdp_predict_BT <- ggpredict(BT_mod_fish_4b, c("gdp2"))
+
+(gdp_plot_BT <- ggplot(data = gdp_predict_BT, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[4], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(GDP~per~capita^2~("USD $ 2010,"~x10^9)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,10))+
+  scale_x_continuous(breaks = c(0,0.5e+9, 1e+9, 1.5e+9,2e+9,2.5e+9), labels = c(0,0.5,1,1.5,2,2.5))+
+      annotation_custom(gdp_png, xmin = 0, xmax = 0.31e+9, ymin = 0, ymax=3.3)+
+    geom_text(x=1e+9, y=9.8, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_4b))["gdp2", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+#Age-dependency ratio
+ad_predict_BT <- ggpredict(BT_mod_fish_4b, c("a_d_ratio"))
+
+(ad_plot_BT <- ggplot(data = ad_predict_BT, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[4], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Age-dependency~ratio))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,26), breaks = seq(from =0, to =25, by=5))+
+    annotation_custom(ad_png, xmin = 20, xmax = 35, ymin = 0.5, ymax=7)+
+    geom_text(x=70, y=25, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_4b))["a_d_ratio", "t value"], digits = 3),",", "p<0.01"))
+
+)
+
+
+
+#=========================================================================
+
+#BT MODEL WITHOUt ALGAE
+
+summary(BT_mod_fish_8) #Variables of note are aquaculture, fish supply, exports, gdp, 
+
+#aquaculture
+aqua_predict_BT_2 <- ggpredict(BT_mod_fish_8, c("aqua_prod_caput_kg"))
+
+(aqua_plot_BT_2 <- ggplot(data = aqua_predict_BT_2, aes(x=x, y=predicted))+
+    geom_line(colour=lacroix_palette("Lemon", n=6)[6], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+  theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Aquaculture~prod.~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,6))+
+    annotation_custom(aqua_png, xmin = -0.3, xmax = 10, ymin = 0, ymax = 2.5)+
+    geom_text(x=25, y=6, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_8))["aqua_prod_caput_kg", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+
+#fish supply
+fish_supply_predict_BT_2 <- ggpredict(BT_mod_fish_8, c("fish_supply"))
+
+(fish_supply_plot_BT_2 <- ggplot(data = fish_supply_predict_BT_2, aes(x=x, y=predicted))+
+    geom_line(colour=lacroix_palette("Lemon", n=6)[6], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~supply~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number(), limits = c(0,42))+
+    annotation_custom(supply_png, xmin = 0, xmax = 8, ymin = 30, ymax=42)+
+    geom_text(x=0, y=25, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_8))["fish_supply", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+#fish exports
+exports_predict_BT_2 <- ggpredict(BT_mod_fish_8, c("exports_caput_kg"))
+
+(exports_plot_BT_2 <- ggplot(data = exports_predict_BT_2, aes(x=x, y=predicted))+
+    geom_line(colour=lacroix_palette("Lemon", n=6)[6], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Fish~exports~(kg~capita^-1)))+
+    scale_y_continuous(labels = scales::label_number())+
+  annotation_custom(exports_png, xmin = 0, xmax = 7, ymin = 50, ymax=70)+
+    geom_text(x=0, y=40, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_8))["exports_caput_kg", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+#gdp^2
+gdp_predict_BT_2 <- ggpredict(BT_mod_fish_8, c("gdp2"))
+
+(gdp_plot_BT_2 <- ggplot(data = gdp_predict_BT_2, aes(x=x, y=predicted))+
+    geom_line(colour=lacroix_palette("Lemon", n=6)[6], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(GDP~per~capita^2~("USD $ 2010,"~x10^9)))+
+    scale_y_continuous(labels = scales::label_number())+
+  scale_x_continuous(breaks = c(0,0.5e+9, 1e+9, 1.5e+9,2e+9,2.5e+9), labels = c(0,0.5,1,1.5,2,2.5)) +
+    annotation_custom(gdp_png, xmin = 0, xmax = 0.31e+9, ymin = 0, ymax=2)+
+    geom_text(x=1.25e+9, y=5, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_8))["gdp2", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+ad_predict_BT_2 <- ggpredict(BT_mod_fish_8, c("a_d_ratio"))
+
+(ad_plot_BT_2 <- ggplot(data = ad_predict_BT_2, aes(x=x, y=predicted))+
+  geom_line(colour=lacroix_palette("Lemon", n=6)[6], size=1)+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)+
+  theme_pubr()+
+    theme(text = element_text(size=8),
+          axis.title.y = element_blank())+
+  labs(y="Predicted per capita fisheries landings (tonnes)", x=bquote(Age-dependency~ratio))+
+    scale_y_continuous(labels = scales::label_number(), limits=c(0,10))+
+    scale_x_continuous(limits = c(25,125), breaks = c(25, 50, 75, 100, 125))+
+    annotation_custom(ad_png, xmin = 25, xmax = 40, ymin = 0, ymax=3.5)+
+    geom_text(x=65, y=9.8, hjust = 0, size = 3, label=paste("t=",signif(coef(summary(BT_mod_fish_8))["a_d_ratio", "t value"], digits = 3),",", "p<0.001"))
+)
+
+
+
+
+```
+
+#COMBINE MARGINAL EFFECTS PLOTS
+```{r}
+blank_plot <- ggplot()+theme(panel.background = element_blank())
+
+
+
+
+# (compound <- gridExtra::grid.arrange(aqua_plot_full, fish_supply_plot_full, exports_plot_full, gdp_plot_full, ad_plot_full, CV_plot_full,
+#                         aqua_plot_BT, fish_supply_plot_BT, exports_plot_BT, gdp_plot_BT, ad_plot_BT,
+#                         aqua_plot_BT_2, fish_supply_plot_BT_2, exports_plot_BT_2, gdp_plot_BT_2,
+#                         layout_matrix = cbind(c(1,2,3,4,5,6), c(7,8,9,10,11, NA), c(12,13,14,15, NA, NA)),
+#                         ncol=3,
+#                         nrow=6))
+
+
+(compound <- ggarrange(plotlist = list(aqua_plot_full,aqua_plot_BT, aqua_plot_BT_2, 
+                             fish_supply_plot_full, fish_supply_plot_BT,  fish_supply_plot_BT_2,
+                             exports_plot_full, exports_plot_BT,  exports_plot_BT_2,
+                             gdp_plot_full,  gdp_plot_BT, gdp_plot_BT_2,
+                             ad_plot_full, ad_plot_BT,  ad_plot_BT_2,
+                             CV_plot_full, blank_plot, blank_plot),
+             labels = c(letters[1], letters[7], letters[12],
+                        letters[2], letters[8], letters[13],
+                        letters[3], letters[9], letters[14],
+                        letters[4], letters[10], letters[15], 
+                        letters[5], letters[11], "",
+                        letters[6], "", ""),
+             font.label = list(size=8),
+             label.x = -0.025,
+             ncol=3,
+             nrow =6))
+
+
+compound2 <- annotate_figure(compound, 
+                             left = text_grob(bquote(Fisheries~landings~(kg~capita^-1)), rot = 90, size=10),
+                             top=text_grob(bquote("                 "~All-producing~countries~"             "~Aquaculture-dominant~(incl.~seaweeds)~"    "~Aquaculture-dominant~(excl.~seaweeds)~""), hjust=0.5, size=8))
+
+ggsave(here("output", "figs", paste0("GLM_marginal_effects_plot", Sys.Date(), ".png")), device = "png", height = 22, width = 18, units="cm", plot= compound2, dpi = 600)
+  ggsave(here("output", "figs", paste0("GLM_marginal_effects_plot", Sys.Date(), ".jpg")), height = 22, width = 18, units = "cm", plot=compound2, dpi=600)
+  ggsave(here("output", "figs", paste0("GLM_marginal_effects_plot", Sys.Date(), ".pdf")), device = cairo_pdf, height = 22, width = 18, units = "cm", plot=compound2, dpi=600)
+  ggsave(here("output", "figs", paste0("GLM_marginal_effects_plot", Sys.Date(), ".tiff")), device = "tiff", height = 22, width = 18, units = "cm", plot=compound2, dpi=600)
+
+```
+
+
+#PLOT PATHWAYS FOR 28 AQUACULTURE-DOMINANT COUNTRIES
+
+```{r}
+
+
+(pathway_results <- vroom::vroom(here("explore", "cottrell_explore", "pathways_results.csv")) %>% 
+  clean_names() %>% 
+  rename(current_trajectory = current_fisheries_landings_trajectory_from_loess_fit,
+         overfishing = overfishing_likely_contributor_to_current_fisheries_trajectory) %>% 
+  select(country, turnaround_point, time_since_turnaround, seaweed_dependent, current_trajectory, overfishing, fish_scarcity, state_policy, development, globalization) %>% 
+  mutate(continent = countrycode(country, origin = "country.name", destination = "continent", warn=TRUE),
+         state_policy = case_when(country == "Bangladesh" ~ 1,
+                                  TRUE ~ state_policy))
+)
+
+#summary stats
+
+pathway_results %>% 
+  pivot_longer(names_to = "pathway", values_to = "count", !c(country, turnaround_point, time_since_turnaround, seaweed_dependent, current_trajectory, overfishing, continent)) %>% 
+  mutate(count = case_when(is.na(count) ~ 0,
+                           TRUE ~ count)) %>% 
+  group_by(continent, pathway) %>% 
+  summarise(count=sum(count)) %>% 
+  ggplot(aes(x=continent, y=count, fill=pathway))+geom_bar(stat = "identity")
+
+#length of time since turn around relative to current trajectory
+pathway_results %>% 
+  group_by(current_trajectory) %>% 
+  summarise(mean_time = mean(time_since_turnaround),
+            freq = n())
+
+
+pathway_results %>% 
+  ggplot(aes(x=current_trajectory, y=time_since_turnaround, fill=current_trajectory))+geom_boxplot()+
+  labs(x="Current landings trajectory", y="Time since turnaround point (years)")+
+  scale_fill_manual(values = rev(lacroix_palette("Lemon", n=8)[c(1,6)]))+
+  theme_pubr()+
+  theme(legend.title = element_blank(),
+        text = element_text(size=10),
+        axis.title = element_text(face = "bold"))+
+  ggsave(here("explore", "cottrell_explore", "Supplementary Figure - time vs trajectory.jpg"), dpi = 300, device = "jpg", width = 10, height=10, units = "cm")
+  
+
+
+
+
+
+
+#tile plot
+pathway_results %>% 
+  rename(`Fish scarcity` = fish_scarcity,
+         `State policy` = state_policy,
+         Development = development,
+         Globalization = globalization) %>% 
+  pivot_longer(names_to = "pathway", values_to = "count", !c(country, turnaround_point, time_since_turnaround, seaweed_dependent, current_trajectory, overfishing, continent)) %>% #put into long format
+  mutate(pathway = factor(pathway, levels = c("Fish scarcity", "State policy", "Development", "Globalization"))) %>% 
+  mutate(Overexploitation = case_when(overfishing == "Yes" & count==1 ~ "Yes",
+                                (overfishing == "No" | overfishing=="Unclear") & count ==1 ~ "No/unclear"),
+         count = factor(count)) %>% 
+  ggplot(aes(x=pathway, y=reorder(country, desc(country))))+
+  geom_tile(aes( fill=Overexploitation, colour=Overexploitation), lwd = 0.3)+
+  ggpattern::geom_rect_pattern(pattern="stripe", xmin=1.5, xmax=2.5, ymin=7.5, ymax=8.5, alpha=0, pattern_density=0.2, pattern_spacing=0.02, pattern_size=0.003, pattern_fill="grey40", pattern_colour="grey40")+
+  ggpattern::geom_rect_pattern(pattern="stripe", xmin=3.5, xmax=4.5, ymin=2.5, ymax=3.5, alpha=0, pattern_density=0.2, pattern_spacing=0.02, pattern_size=0.003, pattern_fill="grey40", pattern_colour="grey40")+
+  ggpattern::geom_rect_pattern(pattern="stripe", xmin=0.5, xmax=1.5, ymin=10.5, ymax=11.5, alpha=0, pattern_density=0.2, pattern_spacing=0.02, pattern_size=0.003, pattern_fill="grey40", pattern_colour="grey40")+
+  ggpattern::geom_rect_pattern(pattern="stripe", xmin=3.5, xmax=4.5, ymin=10.5, ymax=11.5, alpha=0, pattern_density=0.2, pattern_spacing=0.02, pattern_size=0.003, pattern_fill="grey40", pattern_colour="grey40")+
+  ggpattern::geom_rect_pattern(pattern="stripe", xmin=1.5, xmax=2.5, ymin=18.5, ymax=19.5, alpha=0, pattern_density=0.2, pattern_spacing=0.02, pattern_size=0.003, pattern_fill="grey40", pattern_colour="grey40")+
+  #scale_alpha_manual(values = c(1, 0.5))+
+  scale_fill_manual(breaks = c("Yes", "No/unclear"), values = rev(lacroix_palette("Lemon", n=8)[c(1,1,6)]), na.value="grey85")+
+  scale_color_manual(values = c("grey40", "grey40"))+
+  scale_pattern_spacing_manual(values = 0.2)+
+  theme_pubr()+
+  theme(aspect.ratio = 21/5,
+        axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.y = element_blank(),
+        text = element_text(size=10),
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        legend.position = "right", 
+        legend.key.size = unit(0.4, "cm"))+
+  labs(x= "Transition pathway")+
+  guides(colour=FALSE, linetype = FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Figure 3 - pathways.jpg"), dpi = 600, device="jpg", width=8, height = 13, units="cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure 3 - pathways.tiff"), dpi = 600, device="tiff", width=8, height = 13, units="cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure 3 - pathways.pdf"), dpi = 600, device="pdf", width=8, height = 13, units="cm")+
+   ggsave(here("explore", "cottrell_explore", "Figure 3 - pathways.png"), dpi = 600, device="png", width=8, height = 13, units="cm")
+
+
+```
+
+
+# case studies
+
+```{r}
+upsides_tidy %>% filter(country_name=="China" & Year>1980)
+
+blue_transition_prod %>%
+  filter(country_name == "Singapore" & sector=="Aquaculture") %>%
+  arrange(-quantity, -year, species) %>%
+  #filter(species %in% c("EMA" )) %>% 
+  #filter(!species %in% c("MZZ", "FRF", "MOL", "CRU")) %>% 
+  ggplot(aes(x=year, y=quantity, color=species, linetype=sector))+
+  geom_line()
+    #geom_point()
+
+
+
+
+# (china <- ggplot(data= production_tidy %>% filter(country_name == "China") %>% 
+#          select(country_name, year, quantity, sector) %>% 
+#            group_by(country_name, year, sector) %>% 
+#            summarise(value=sum(quantity)) %>% 
+#            ungroup(),
+#          # pivot_longer(cols = c(aquaculture_prod, capture_prod),
+#          #              names_to = "sector",
+#          #              values_to = "value") %>% 
+#          # mutate(sector = case_when(sector == "aquaculture_prod" ~ "Aquaculture ", 
+#          #                           TRUE ~ "Capture")), 
+#        aes(x=year, y=value, group=sector, colour=sector))+ 
+#   geom_line(size=.9)+
+#   #geom_point()+
+#   theme_pubr()+
+#    labs(subtitle = "China")+
+#   theme(text = element_text(size=10),
+#         axis.title = element_blank(),
+#         legend.title = element_blank())+
+#   scale_color_manual(values = c("dodgerblue3", "firebrick"))
+# )
+# 
+# 
+# 
+# 
+# (greece <- ggplot(data=blue_prod_w_covariates %>% filter(country_name == "Greece") %>% 
+#          select(country_name, year, aqua_prod_caput, capture_prod_caput) %>% 
+#          pivot_longer(cols = c(aqua_prod_caput, capture_prod_caput),
+#                       names_to = "sector",
+#                       values_to = "value") %>% 
+#          mutate(sector = case_when(sector == "aqua_prod_caput" ~ "Aquaculture ", 
+#                                    TRUE ~ "Capture")), 
+#        aes(x=year, y=value,colour=sector))+ 
+#  geom_line(size=.9)+
+#   #geom_point()+
+#   theme_pubr()+
+#      labs(subtitle = "Greece")+
+#   theme(text = element_text(size=10),
+#         axis.title = element_blank(),
+#         legend.title = element_blank())+
+#   scale_color_manual(values = c("dodgerblue3", "firebrick"))
+#   )
+#OVERALL SIMILARITY DATA
+
+
+(non_coproducers <- production_tidy_2 %>% #taking "area" out of the equation
+  group_by(country, country_name, species, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year==2017) %>% 
+  group_by(country, country_name, sector) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(quantity == 0) %>% 
+  .$country_name %>% 
+  unique())
+
+global_tidy <- production_tidy_2 %>% #taking "area" out of the equation
+  group_by(country, country_name, species, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(!country_name %in% non_coproducers)
+
+unique(global_tidy$country_name)
+
+#Separate aquaculture and fisheries and join columns
+
+(global_aqua <- global_tidy %>% 
+  filter(sector=="Aquaculture") %>% 
+  rename(aquaculture=quantity) %>% 
+  ungroup() %>% 
+  select(-sector) %>% 
+  mutate(aquaculture = case_when(aquaculture==0 ~ NA_real_,
+                                 TRUE ~ aquaculture))
+)
+
+(global_capture <- global_tidy %>% 
+  filter(sector=="Capture") %>% 
+  rename(capture=quantity) %>% 
+  ungroup() %>% 
+  select(-sector) %>% 
+  mutate(capture = case_when(capture==0 ~ NA_real_,
+                                 TRUE ~ capture))
+  )
+
+
+global_similarity <- full_join(global_capture, global_aqua, by=c("country", "country_name", "species", "year")) %>% 
+  arrange(country,year) %>%
+  filter(!(is.na(aquaculture) & is.na(capture))) %>% 
+  mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+  ungroup() %>% 
+    group_by(country, country_name, year) %>% #bray curtis calculations
+    summarise(sum_lesser = sum(lesser, na.rm = TRUE), #numerator
+              total_capture = sum(capture, na.rm = TRUE),
+              total_aqua = sum(aquaculture, na.rm = TRUE),
+              .groups = "keep") %>% 
+    mutate(sector_totals = sum(total_capture, total_aqua)) %>% #denominator
+    mutate(bray_curtis = ((2*sum_lesser)/sector_totals)*100)
+
+global_similarity %>% filter(year==2017) %>% arrange(country_name)
+
+
+
+#CHINA
+
+(upsides_china_total <- upsides_tidy %>% filter(country_name=="China" & Year<2017) %>% 
+ group_by(Year) %>% 
+  summarise(BvBmsy = mean(BvBmsy)) %>% 
+    rename(year=Year))
+
+
+
+(china_fish_trends <- bind_rows(
+  production_tidy %>% filter(country_name == "China", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = n(),
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Capture total"),
+    #left_join(upsides_israel_total, by="year"),
+  
+  production_tidy %>% filter(country_name == "China", sector=="Aquaculture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = NA_real_,
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Aquaculture total",
+           BvBmsy = NA_real_),
+  
+  
+  production_tidy %>% filter(country_name == "China", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    group_by(country_name, year, species) %>% 
+    summarise(quantity = sum(quantity)) %>% 
+    ungroup() %>% 
+    arrange(-year,-quantity,  species) %>%
+    group_by(year) %>% 
+    nest() %>% 
+    mutate(prop = map(data, ~(.$quantity/sum(.$quantity)))) %>% 
+    unnest() %>% 
+    nest() %>% 
+    mutate(cum_prop = map(data, ~(cumsum(.$prop)))) %>% 
+    unnest() %>% 
+    filter(species %in% c("MZZ", "FRF", "LHT", "JAN", "SDX", "GAZ", "MAS", "MOL", "AKS", "SQU")) %>% #top 10 stocks from 2017 that represent 50% of production 
+    rename(stock=species) %>% 
+    ungroup() %>% 
+    mutate(no_species = NA_real_,
+           BvBmsy = NA_real_,
+           stock = case_when(stock == "MZZ" ~ "Marine fishes nei", 
+                             stock == "FRF" ~ "Freshwater fishes nei",
+                              stock == "LHT" ~ "Largehead hairtail",
+                             stock == "JAN" ~ "Japanese anchovy",
+                             stock == "SDX" ~ "Scads nei",
+                             stock == "GAZ" ~ "Gazami crab",
+                             stock == "MAS" ~ "Pacific Chub Mackerel",
+                             stock == "MOL" ~ "Marine molluscs nei",
+                             stock == "AKS" ~ "Akamai shrimp",
+                             stock == "SQU" ~ "Squids nei",
+                             TRUE ~ stock
+                             )) %>% 
+    select(country_name, year, no_species, quantity, stock, BvBmsy)
+) %>%
+    mutate(position = case_when(year == 1955 ~ 2.8,
+                                year==1965 ~ 2.7,
+                                year==1975 ~ 2.5,
+                                year==1985~ 2.3,
+                                year ==1995 ~ 1.4,
+                                year == 2005 ~ 1.3,
+                                year==2015 ~ 1.2)))
+
+
+
+(china_similarity <- global_similarity %>% filter(country_name=="China") %>% ungroup() %>% 
+  select(year, bray_curtis))
+
+china_fish_trends <- china_fish_trends %>% 
+  left_join(china_similarity, by="year")
+
+
+
+china_plot <- ggplot(data=china_fish_trends %>% filter(stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Capture total", "Aquaculture total"))), aes(x=year, y=quantity))+
+  #geom_area(fill="grey92")+
+  geom_line(aes(colour=stock))+
+  scale_color_manual(values= c("black", "dodgerblue4"))+
+  scale_fill_manual(values =  rev(lacroix_palette("Lemon", n=10)))+
+  geom_area(data = china_fish_trends %>% filter(!stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Capture total", "Aquaculture total","Marine fishes nei", "Freshwater fishes nei", "Largehead hairtail", "Japanese anchovy", "Scads nei", "Gazami crab", "Pacific Chub Mackerel","Marine molluscs nei", "Akamai shrimp","Squids nei" ))), aes(x=year, y=quantity, fill=stock))+
+  theme_pubr()+
+  theme(legend.title = element_blank(),
+        plot.subtitle = element_text(face="bold"),
+        legend.box = "vertical",
+        legend.box.just = "left",
+        legend.spacing.y = unit(0.001, "cm"),
+        legend.background = element_rect(fill = "transparent", colour="transparent"),
+        legend.position = c(0.2, 0.63),
+        legend.key.size = unit(0.35, "cm"),
+        text = element_text(size=8),
+        legend.text = element_text(size=7))+
+  geom_vline(xintercept = 1984, colour="grey60", linetype=2)+
+  geom_point(data = china_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position), colour="black", size=6)+
+  geom_text(data = china_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=round(no_species)), colour="white", size=2)+
+  geom_text(data = china_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Aquaculture total"), aes(x=year-1.35, y = quantity*c(7, 3, 2.1, 1.3, 1.25,1.15,1.076) , label=paste(round(bray_curtis, digits = 2),"%")), colour="black", size=2)+
+  geom_text(x=1989, y=53e+6, size=2.5, label="Turnaround\npoint", hjust=0)+
+  annotate("segment", x = 1984.3, xend = 1988, y = 53e+6, yend = 53e+6, arrow = arrow(ends = "first", length = unit(0.08, "cm")))+
+  #guides(fill = guide_legend(nrow = 5, ncol = 2))+
+  labs(y="Production (million tonnes)", subtitle = "China", x="Year", fill="Capture species")+
+  scale_y_continuous(labels = c(0, 20, 40, 60), expand = c(0,0))+
+  scale_x_continuous(expand = c(0.08,0))+
+  coord_cartesian(clip = 'off')+
+  
+  # geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=no_species), colour="black")+
+  ggsave(here("explore", "cottrell_explore", "china_trends_biomass.jpg"), device = "jpg", dpi=300, height = 8, width = 10, units = "cm")
+
+
+
+
+#ISRAEL
+
+
+(upsides_israel_total <- upsides_tidy %>% filter(country_name=="Israel" & Year<2017) %>% 
+ group_by(Year) %>% 
+  summarise(BvBmsy = mean(BvBmsy)) %>% 
+    rename(year=Year))
+
+
+(israel_fish_trends <- bind_rows(
+  production_tidy %>% filter(country_name == "Israel", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = n(),
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Capture total") %>% 
+    left_join(upsides_israel_total, by="year"),
+  
+  production_tidy %>% filter(country_name == "Israel", sector=="Aquaculture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = NA_real_,
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Aquaculture total",
+           BvBmsy = NA_real_),
+  
+  
+  production_tidy %>% filter(country_name == "Israel", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    group_by(country_name, year, species) %>% 
+    summarise(quantity = sum(quantity)) %>% 
+    ungroup() %>% 
+    filter(species %in% c("HKC", "SAA", "FCY")) %>% 
+    add_row(country_name = "Israel", year = 1964, species = "HKC", quantity = 0) %>% 
+    arrange(species, year) %>%
+    mutate(BvBmsy = NA_real_) %>% 
+    #left_join(upsides_israel_spp, by=c("species", "year")) %>% 
+    rename(stock=species) %>% 
+    mutate(no_species = 1) %>% 
+    select(country_name, year, no_species, quantity, stock, BvBmsy)
+) %>%
+    mutate(position = case_when(year == 1955 ~ 1.85, 
+                                year==1965 ~ 1.5, 
+                                year==1975 ~ 1.13,
+                                year==1985~ 1.1,
+                                year ==1995 ~ 1.5,
+                                year == 2005 ~ 1.6, 
+                                year==2015 ~ 1.8),
+           stock = case_when( stock == "HKC" ~ "Cape hakes",
+                     stock == "SAA" ~ "Round sardinella",
+                     stock == "FCY" ~ "Freshwater carps/cyprinids",
+                     TRUE ~ stock)))
+
+(israel_similarity <- global_similarity %>% filter(country_name=="Israel") %>% ungroup() %>% 
+  select(year, bray_curtis))
+
+israel_fish_trends <- israel_fish_trends %>% 
+  left_join(israel_similarity, by="year")
+
+
+israel_plot <- ggplot(data=israel_fish_trends %>% filter(stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Capture total", "Aquaculture total"))), aes(x=year, y=quantity))+
+  #geom_area(fill="grey92")+
+  geom_line(aes(colour=stock))+
+  scale_color_manual(values= c("black", "dodgerblue4"))+
+  scale_fill_manual(values =  lacroix_palette("Lemon", n=8)[c(1,5,8)])+
+  geom_area(data = israel_fish_trends %>% filter(!stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Freshwater carps/cyprinids", "Round sardinella", "Cape hakes"))), 
+            aes(x=year, y=quantity, fill=stock))+
+  theme_pubr()+
+  theme(legend.title = element_blank(),
+    text=element_text(size=8),
+        legend.direction = "vertical",
+        legend.spacing.y = unit(0.0001, "cm"),
+        plot.subtitle = element_text(face="bold"),
+        legend.background = element_rect(fill = "transparent", colour="transparent"),
+        legend.key.size = unit(0.35, "cm"),
+        legend.position = c(0.22,0.92))+
+  geom_vline(xintercept = 1988, colour="grey30", linetype=2)+
+  geom_point(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position), colour="black", size=6)+
+  geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=round(no_species)), colour="white", size=2)+
+  geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Aquaculture total"), aes(x= c(1955, 1965.5, 1975, 1985, 1995, 2005, 2015), y = quantity*c(1.1,0.96,1.2,0.8,1.2,1.05,1.2), label=paste(round(bray_curtis, digits = 2),"%")), colour="black", size=2)+
+  guides(fill = guide_legend(ncol=1, byrow = TRUE, order = 1), colour=FALSE)+
+  scale_y_continuous(labels = c(0,5,10,15,20), breaks = c(0, 5000, 10000, 15000, 20000), expand = c(0,0))+
+  scale_x_continuous(expand = c(0.08,0))+
+  labs(y= "Production (thousand tonnes)", subtitle = "Israel", x="Year")+
+  # geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=no_species), colour="black")+
+  coord_cartesian(clip = 'off')+
+  ggsave(here("explore", "cottrell_explore", "israel_trends_biomass.jpg"), device = "jpg", dpi=300, height = 8, width = 9, units = "cm")
+
+
+
+#EGYPT
+
+
+(upsides_egypt_total <- upsides_tidy %>% filter(country_name=="Egypt" & Year<2017) %>% 
+ group_by(Year) %>% 
+  summarise(BvBmsy = mean(BvBmsy)) %>% 
+    rename(year=Year))
+
+
+(egypt_fish_trends <- bind_rows(
+  production_tidy %>% filter(country_name == "Egypt", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = n(),
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Capture total") %>% 
+    left_join(upsides_israel_total, by="year"),
+  
+  production_tidy %>% filter(country_name == "Egypt", sector=="Aquaculture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = NA_real_,
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Aquaculture total",
+           BvBmsy = NA_real_),
+  
+  
+  production_tidy %>% filter(country_name == "Egypt", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    group_by(country_name, year, species) %>% 
+    summarise(quantity = sum(quantity)) %>% 
+    ungroup() %>% 
+    arrange(-year, -quantity) %>% 
+    # filter(species %in% c("HKC", "SAA", "FCY")) %>% 
+    # add_row(country_name = "Israel", year = 1964, species = "HKC", quantity = 0) %>% 
+    # group_by(year) %>%
+    # nest() %>% 
+    #   mutate(prop = map(data, ~(.$quantity/sum(.$quantity)))) %>% 
+    # unnest() %>% 
+    # nest() %>% 
+    # mutate(cum_prop = map(data, ~(cumsum(.$prop)))) %>% 
+    # unnest() %>% 
+    filter(species %in% c("TLN", "CLN", "MUL", "SIX", "FCG", "FRF", "SDX", "DCP", "BGJ", "MZZ")) %>% 
+    # left_join(upsides_egypt_spp, by=c("species", "year")) %>% 
+    rename(stock=species) %>% 
+    mutate(no_species = 1,
+           BvBmsy = NA_real_) %>% 
+    select(country_name, year, no_species, quantity, stock, BvBmsy) %>% 
+    mutate(stock = case_when(stock == "TLN" ~ "Nile tilapia",
+                             stock == "CLN" ~ "Mudfish", 
+                             stock == "MUL" ~ "Mullets nei",
+                             stock == "SIX" ~ "Sardinellas nei",
+                             stock == "FCG" ~ "Grass carp",
+                             stock == "FRF" ~ "Freshwater fishes nei",
+                             stock == "SDX" ~ "Scads nei",
+                             stock == "DCP" ~ "Natantian decapods nei",
+                             stock == "BGJ" ~ "Bayad (catfish)",
+                             stock == "MZZ" ~ "Marine fishes nei",
+                             TRUE ~ stock))
+))
+  
+#  %>%
+#     mutate(position = case_when(year == 1955 ~ 1.85, 
+#                                 year==1965 ~ 1.5, 
+#                                 year==1975 ~ 1.13,
+#                                 year==1985~ 1.1,
+#                                 year ==1995 ~ 1.5,
+#                                 year == 2005 ~ 1.6, 
+#                                 year==2015 ~ 1.8),
+#            stock = case_when( stock == "HKC" ~ "Cape hakes",
+#                      stock == "SAA" ~ "Round sardinella",
+#                      stock == "FCY" ~ "Freshwater carps/cyprinids",
+#                      TRUE ~ stock)))
+
+
+(egypt_similarity <- global_similarity %>% filter(country_name=="Egypt") %>% ungroup() %>% 
+  select(year, bray_curtis))
+
+egypt_fish_trends <- egypt_fish_trends %>% 
+  left_join(egypt_similarity, by="year")
+
+
+global_similarity %>% filter(country_name=="Egypt")
+
+
+egypt_plot <- ggplot(data=egypt_fish_trends %>% filter(stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Capture total", "Aquaculture total"))), aes(x=year, y=quantity))+
+  scale_fill_manual(values =  lacroix_palette("Lemon", n=10))+
+  geom_area(data = egypt_fish_trends %>% filter(!stock %in% c("Capture total", "Aquaculture total")) %>% 
+              add_row(country_name="Eygpt", year=1990, quantity=0, stock="Nile tilapia", BvBmsy=NA_real_) %>%
+              add_row(country_name="Eygpt", year=1990, quantity=0, stock="Mudfish", BvBmsy=NA_real_) %>%
+              add_row(country_name="Eygpt", year=1994, quantity=0, stock="Grass carp", BvBmsy=NA_real_) %>% 
+              mutate(stock = factor(stock, levels = c("Scads nei", "Bayad (catfish)", "Natantian decapods nei", "Grass carp", "Marine fishes nei",
+                                                      "Sardinellas nei", "Mullets nei", "Mudfish", "Nile tilapia", "Freshwater fishes nei"))), 
+            aes(x=year, y=quantity, fill=stock))+
+  #geom_area(fill="grey92")+
+  geom_line(aes(colour=stock))+
+  scale_color_manual(values= c("black", "dodgerblue4"))+
+  theme_pubr()+
+  theme(legend.title = element_blank(),
+        text=element_text(size=8),
+        plot.subtitle = element_text(face="bold"),
+        legend.direction = "vertical",
+        legend.spacing.y = unit(0.0001, "cm"),
+        legend.background = element_rect(fill = "transparent", colour="transparent"),
+        legend.key.size = unit(0.35, "cm"),
+        legend.position = c(0.195,0.67))+
+  geom_vline(xintercept = 2003, colour="grey30", linetype=2)+
+  geom_point(data = egypt_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*1.2), colour="black", size=6)+
+  geom_text(data = egypt_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*1.2, label=round(no_species)), colour="white", size=2)+
+  geom_text(data = egypt_fish_trends %>% filter(year %in% c(1965, 1975, 1985, 1995, 2005, 2015) & stock=="Aquaculture total"), aes(x=year, y = quantity*c(3.75,3,1.1,1.1,1.3,1.25), label=paste(round(bray_curtis, digits = 2),"%")), colour=c( "white", "white", "white", "white","black","black"), size=2)+
+  guides(fill = guide_legend(ncol=1, byrow = TRUE),
+         colour = FALSE)+
+  scale_y_continuous(labels = c(0,0.5,1,1.5), breaks = c(0,0.5e+6,1e+6,1.5e+6), expand = c(0,0), limits=c(0,1.5e+6))+
+  scale_x_continuous(expand = c(0.08,0))+
+  #scale_x_continuous(expand = c(0.01,0.01))+
+  labs(y= "Production (million tonnes)", subtitle = "Egypt", x="Year")+
+  # geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=no_species), colour="black")+
+  
+  coord_cartesian(clip="off")+
+  ggsave(here("explore", "cottrell_explore", "egypt_trends_biomass.jpg"), device = "jpg", dpi=300, height = 8, width = 10, units = "cm")
+
+
+#AUSTRIA
+
+(austria_fish_trends <- bind_rows(
+  production_tidy %>% filter(country_name == "Austria", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = n(),
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Capture total",
+           BvBmsy = NA_real_),
+    # left_join(upsides_israel_total, by="year"),
+  
+  production_tidy %>% filter(country_name == "Austria", sector=="Aquaculture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    arrange(-quantity, species) %>% 
+    group_by(country_name, year) %>% 
+    summarise(no_species = NA_real_,
+              quantity=sum(quantity)) %>% 
+    ungroup() %>%
+    mutate(stock="Aquaculture total",
+           BvBmsy = NA_real_),
+  
+  
+  production_tidy %>% filter(country_name == "Austria", sector=="Capture") %>% 
+    select(country_name, year, quantity, sector, species) %>% 
+    group_by(country_name, year, species) %>% 
+    summarise(quantity = sum(quantity), .groups = "keep") %>% 
+    ungroup() %>% 
+    arrange(-year, -quantity) %>% 
+    # filter(species %in% c("HKC", "SAA", "FCY")) %>% 
+    # add_row(country_name = "Israel", year = 1964, species = "HKC", quantity = 0) %>% 
+    # group_by(year) %>%
+    # nest() %>% 
+    #   mutate(prop = map(data, ~(.$quantity/sum(.$quantity)))) %>% 
+    # unnest() %>% 
+    # nest() %>% 
+    # mutate(cum_prop = map(data, ~(cumsum(.$prop)))) %>% 
+    # unnest() %>% 
+    #filter(species %in% c("TLN", "CLN", "MUL", "SIX", "FCG", "FRF", "SDX", "DCP", "BGJ", "MZZ")) %>% 
+    # left_join(upsides_egypt_spp, by=c("species", "year")) %>% 
+    rename(stock=species) %>% 
+    mutate(no_species = 1,
+           BvBmsy = NA_real_) %>% 
+    mutate(stock = case_when(stock == "FCP" ~ "Common carp",
+                             stock == "FRF" ~ "Freshwater fishes nei", 
+                             stock == "TRR" ~ "Rainbow trout")) %>% 
+    select(country_name, year, no_species, quantity, stock, BvBmsy) %>% 
+    mutate(position = case_when(year == 1955 ~ 1.2, 
+                                year==1965 ~ 1.1,
+                                year==1975 ~ 1.25,
+                                year==1985~ 1.25,
+                                year ==1995 ~ 1.25,
+                                year == 2005 ~ 1.25,
+                                year==2015 ~ 1.25))
+))
+
+(austria_similarity <- global_similarity %>% filter(country_name=="Austria") %>% ungroup() %>% 
+  select(year, bray_curtis))
+
+austria_fish_trends <- austria_fish_trends %>% 
+  left_join(austria_similarity, by="year")
+
+
+
+austria_plot <- ggplot(data=austria_fish_trends %>% filter(stock %in% c("Capture total", "Aquaculture total")) %>% mutate(stock = factor(stock, levels = c("Capture total", "Aquaculture total"))), aes(x=year, y=quantity))+
+  scale_fill_manual(values =  lacroix_palette("Lemon", n=8)[c(1,5,8)])+
+  geom_area(data = austria_fish_trends %>% filter(!stock %in% c("Capture total", "Aquaculture total")) %>% 
+              add_row(country_name="Austria", year=1973, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1974, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1975, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1976, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1977, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1978, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1979, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1973, quantity=0, stock="Rainbow trout", BvBmsy=NA_real_) %>%
+              add_row(country_name="Austria", year=1987, quantity=0, stock="Common carp", BvBmsy=NA_real_) %>%
+              mutate(stock = factor(stock, levels = rev(c("Freshwater fishes nei", "Rainbow trout", "Common carp")))), 
+            aes(x=year, y=quantity, fill=stock))+
+  #geom_area(fill="grey92")+
+  geom_line(aes(colour=stock))+
+  scale_color_manual(values= c("black", "dodgerblue4"))+
+  theme_pubr()+
+  theme(legend.title = element_blank(),
+        text=element_text(size=8),
+        plot.subtitle = element_text(face="bold"),
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(0.0001, "cm"),
+        legend.background = element_rect(fill = "transparent", colour="transparent"),
+        legend.key.size = unit(0.35, "cm"),
+        legend.position = c(0.75,0.9))+
+  geom_vline(xintercept = 1973, colour="grey30", linetype=2)+
+  geom_point(data = austria_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*1.1), colour="black", size=6)+
+  geom_text(data = austria_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2005, 2015) & stock=="Capture total"), aes(x=year, y = quantity*1.1, label=round(no_species)), colour="white", size=2)+
+  geom_text(data = austria_fish_trends %>% filter(year %in% c(1955,1965, 1975, 1985, 1995, 2005, 2015) & stock=="Aquaculture total"), aes(x=year, y = quantity*c(1.3,1.3,1.3,1.15,1.2,1.2,1.1), label=paste(round(bray_curtis, digits = 2),"%")), colour=c("white", "white", "black","black","black","black", "black"), size=2)+
+  guides(fill = guide_legend(ncol=1, nrow=3, byrow = TRUE),
+         colour = FALSE)+
+  scale_y_continuous(labels = c(0,1,2,3,4,5), breaks = c(0,1e+3,2e+3,3e+3,4e+3,5e+3), expand = c(0,0), limits =c(0,5.2e+3))+
+  scale_x_continuous(expand = c(0.08,0))+
+   coord_cartesian(clip="off")+
+  #scale_x_continuous(expand = c(0.01,0.01))+
+  labs(y= "Production (thousand tonnes)", subtitle = "Austria", x="Year")+
+  # geom_text(data = israel_fish_trends %>% filter(year %in% c(1955, 1965, 1975, 1985, 1995, 2015) & stock=="Capture total"), aes(x=year, y = quantity*position, label=no_species), colour="black")+
+  ggsave(here("explore", "cottrell_explore", "austria_trends_biomass.jpg"), device = "jpg", dpi=300, height = 8, width = 10, units = "cm")
+
+
+
+ggarrange(china_plot, egypt_plot, austria_plot, israel_plot,
+          labels = c( "a", "b", "c", "d"),
+          font.label = list(size=10),
+          nrow = 2,
+          ncol=2)+
+  ggsave(here("explore", "cottrell_explore", "Figure 5. - case studies.jpg"), device = "jpg", dpi=600, height = 15, width=18, units = "cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure 5. - case studies.pdf"), device = "pdf", dpi=600, height = 15, width=18, units = "cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure 5. - case studies.png"), device = "png", dpi=600, height = 15, width=18, units = "cm")
+
+```
+
+
+# Simpsons paradox SI figure
+
+
+#Simpsons Paradox figure for the SI
+
+```{r}
+
+#need to run the code that joins predictors to production data but stop before dropping gdp
+
+ggplot(data= production_w_covariates %>% mutate(gdp_total= gdp*pop) %>% filter(country_name %in% blue_transition_prod$country_name), aes(x=log(gdp), y=log(capture_prod_caput)))+geom_point()+
+  theme_pubr()+
+  labs(y=bquote(log(Fisheries~production~capita^-1)), x=bquote(log(GDP~capita^-1)))+
+  theme(text = element_text(size=10))+
+  geom_smooth(aes(colour=country_name), method="lm")+
+  guides(colour=FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - AD countries lm.jpg"), device = "jpg", width = 15, height=10, units="cm")
+
+
+by_total <- ggplot(data= production_w_covariates %>% mutate(gdp_total= gdp*pop), aes(x=log(gdp), y=log(capture_prod_caput)))+geom_point()+
+  theme_pubr()+
+  theme(text = element_text(size=10))+
+  labs(y=bquote(log(Fisheries~production~capita^-1)), x=bquote(log(GDP~capita^-1)))+
+  geom_smooth(method="lm")+
+  guides(colour=FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - ALL countries lm.jpg"), device = "jpg", width = 15, height=10, units="cm")
+
+
+by_country <- ggplot(data= production_w_covariates %>% mutate(gdp_total= gdp*pop), aes(x=log(gdp), y=log(capture_prod_caput)))+geom_point()+
+  theme_pubr()+
+  theme(text = element_text(size=8))+
+  labs(y=bquote(log(Fisheries~production~capita^-1)), x=bquote(log(GDP~capita^-1)))+
+  geom_smooth(aes(colour=country_name), method="lm")+
+  scale_color_manual(values=rep("pink", times=148))+
+  guides(colour=FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - ALL countries lm.jpg"), device = "jpg", width = 15, height=10, units="cm")
+
+ggarrange(by_total, by_country,
+          labels = letters[1:2],
+          font.label = list(size=8),
+          nrow = 1,
+          ncol = 2)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - combined all countries lm.jpg"), device = "jpg", width = 20, height=7.5, units="cm")
+
+
+ggplot(data= production_w_covariates %>% mutate(gdp_total= gdp*pop) %>% filter(country_name %in% blue_transition_prod$country_name), aes(x=log(gdp), y=log(capture_prod_caput)))+geom_point()+
+  theme_pubr()+
+  labs(y=bquote(log(Fisheries~production~capita^-1)), x=bquote(log(GDP~capita^-1)))+
+  theme(text = element_text(size=10))+
+  geom_smooth(aes(colour=country_name), method="loess")+
+  guides(colour=FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - AD countries loess.jpg"), device = "jpg", width = 15, height=10, units="cm")
+
+
+ggplot(data= production_w_covariates %>% mutate(gdp_total= gdp*pop), aes(x=log(gdp), y=log(capture_prod_caput)))+geom_point()+
+  theme_pubr()+
+  theme(text = element_text(size=10))+
+  labs(y=bquote(log(Fisheries~production~capita^-1)), x=bquote(log(GDP~capita^-1)))+
+  geom_smooth(aes(colour=country_name), method="loess")+
+  guides(colour=FALSE)+
+  ggsave(here("explore", "cottrell_explore", "Simpson's paradox - ALL countries loess.jpg"), device = "jpg", width = 15, height=10, units="cm")
+
+
+
+```
+
+
+
+
+#Species composition dissimilarity    
+
+```{r}
+(non_coproducers <- production_tidy_2 %>% #taking "area" out of the equation
+  group_by(country, country_name, species, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year==2017) %>% 
+  group_by(country, country_name, sector) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(quantity == 0) %>% 
+  .$country_name %>% 
+  unique())
+
+#blue transitions
+global_tidy <- production_tidy_2 %>% #taking "area" out of the equation
+  group_by(country, country_name, species, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(!country_name %in% non_coproducers)
+
+unique(global_tidy$country_name)
+
+#Separate aquaculture and fisheries and join columns
+
+(global_aqua <- global_tidy %>% 
+  filter(sector=="Aquaculture" & year==2017) %>% 
+  rename(aquaculture=quantity) %>% 
+  ungroup() %>% 
+  select(-sector, -year) %>% 
+  mutate(aquaculture = case_when(aquaculture==0 ~ NA_real_,
+                                 TRUE ~ aquaculture))
+)
+
+(global_capture <- global_tidy %>% 
+  filter(sector=="Capture" & year ==2017) %>% 
+  rename(capture=quantity) %>% 
+  ungroup() %>% 
+  select(-sector, -year) %>% 
+  mutate(capture = case_when(capture==0 ~ NA_real_,
+                                 TRUE ~ capture))
+  )
+
+
+
+(global_sector_comparisons <- full_join(global_capture, global_aqua, by=c("country", "country_name", "species")) %>% 
+  arrange(country) %>% 
+    # mutate(capture = case_when(is.na(capture) ~ 0,
+    #                            TRUE ~ capture),
+    #        aquaculture = case_when(is.na(aquaculture) ~ 0, 
+    #                                TRUE ~ aquaculture)) %>% 
+     filter(!(is.na(aquaculture) & is.na(capture))) %>% 
+    mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+    group_by(country, country_name) %>% #bray curtis calculations
+    summarise(sum_lesser = sum(lesser, na.rm = TRUE), #numerator
+              total_capture = sum(capture, na.rm = TRUE),
+              total_aqua = sum(aquaculture, na.rm = TRUE)) %>% 
+    mutate(sector_totals = sum(total_capture, total_aqua)) %>% #denominator
+    mutate(bray_curtis = round(((2*sum_lesser)/sector_totals), digits = 3)*100) %>% 
+    mutate(iso_a3 = countrycode(country_name, origin="country.name", destination = "iso3c", warn=TRUE)) %>% 
+    drop_na(iso_a3)
+   
+)
+
+
+#take shapefiles from covid folder
+
+bbox_dir <- file.path("", "home", "cottrell", "Github", "covid19", "shapefiles", "ne_110m_graticules_all")
+countries_dir <- file.path("", "home", "cottrell", "Github", "covid19", "shapefiles", "ne_110m_admin_0_countries")
+
+bbox <- readOGR(dsn=bbox_dir, layer="ne_110m_wgs84_bounding_box")
+bbox <- spTransform(bbox, CRS("+proj=robin"))  # reproject bounding box
+bbox_df<- fortify(bbox) #, group="ISO_TER1"
+
+
+#JOIN to COUNTRY DATA
+countries_shp<-readOGR(countries_dir, layer="ne_110m_admin_0_countries")
+#prod_dist <- prod_dist[!prod_dist$iso_a3 %in% c("ATA"),] #remove antartica
+countries_shp<-spTransform(countries_shp, CRS("+proj=robin"))
+countries_shp@data$id<-rownames(countries_shp@data)
+countries_shp@data<-left_join(countries_shp@data, global_sector_comparisons, by="iso_a3")
+countries_shp_df<-fortify(countries_shp)
+countries_shp_df<-left_join(countries_shp_df, countries_shp@data, by="id")
+
+
+#MAP data
+
+(dissimilarity_Map <- ggplot(data=bbox_df, aes(long,lat, group=group)) +
+  geom_polygon(fill="aliceblue", colour= NA, size=0.2)+
+  geom_map(data=countries_shp_df, map=countries_shp_df, aes(x=long, y=lat,fill=bray_curtis, group=group, map_id=id), colour="grey20", size=0.04)+
+  theme_pubr()+
+  theme(panel.grid = element_blank(),
+        text = element_text(size=6),
+        legend.title = element_text(size=8))+
+   scale_fill_stepsn(colors = (lemon_pal), limits=c(0,100), n.breaks = 10, show.limits = TRUE)+
+  theme_void()+
+  theme(legend.position = "bottom")+
+  labs(fill = bquote(Taxa~similarity~("%")))+
+  guides(fill = guide_colourbar(title.position = "top", title.hjust = 0.5, barwidth = unit(6, "cm"), barheight = unit(0.24, "cm") ))+
+  ggsave(here("explore", "cottrell_explore", "Map dissimilarity.jpg"), device = "jpg", dpi=300, width = 9, height=6.3, units = "cm")
+  
+)
+
+
+
+
+#blue transition countries
+
+(aqua_blue_prod <- blue_transition_prod %>% 
+  filter(year ==2017 & sector =="Aquaculture") %>% 
+  rename(aquaculture = quantity) %>% 
+   ungroup() %>% 
+  select(-sector,-year))
+
+(capture_blue_prod <- blue_transition_prod %>% 
+  filter(year ==2017 & sector =="Capture") %>% 
+  rename(capture = quantity) %>% 
+    ungroup() %>%
+    select(-sector,-year))
+
+
+(bt_sector_comparisons <- full_join(capture_blue_prod, aqua_blue_prod, by=c("country", "country_name", "species")) %>% 
+  arrange(country) %>% 
+    # mutate(capture = case_when(is.na(capture) ~ 0,
+    #                            TRUE ~ capture),
+    #        aquaculture = case_when(is.na(aquaculture) ~ 0, 
+    #                                TRUE ~ aquaculture)) %>% 
+    mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+    group_by(country, country_name) %>% #bray curtis calculations
+    summarise(sum_lesser = sum(lesser, na.rm = TRUE), #numerator
+              total_capture = sum(capture, na.rm = TRUE),
+              total_aqua = sum(aquaculture, na.rm = TRUE)) %>% 
+    mutate(sector_totals = sum(total_capture, total_aqua)) %>% #denominator
+    mutate(bray_curtis = round(((2*sum_lesser)/sector_totals), digits = 3)) %>% 
+    filter(!country_name %in% c("Cyprus", "Singapore"))
+   
+)
+
+
+(disimilarity_BT <- ggplot(data=bt_sector_comparisons, aes(x=reorder(country_name, -bray_curtis), y=bray_curtis))+
+ 
+  geom_segment(aes(x=reorder(country_name, -bray_curtis), xend=reorder(country_name, -bray_curtis), y=0, yend=bray_curtis), colour=lacroix_palette("Lemon", n=10)[2], size=1)+
+   geom_point( colour=lacroix_palette("Lemon", n=3)[3], size=2)+
+  theme_pubr()+
+  theme(axis.title.x = element_blank(),
+        text = element_text(size=8),
+        axis.text.x = element_text(angle=45, hjust=1, size = 6),
+        plot.margin = unit(c(0.5, 0.2,0.2,0.2), units = "cm"),
+        panel.grid.major.y = element_line(colour="grey70", linetype = 2)
+        )+
+  scale_y_continuous(limits = c(0,1), breaks = c(0,.25, .5, .75,1), labels = c(0,25,50,75,100) )+
+  #geom_hline(yintercept = 0.5, colour = "grey70", linetype=2)+
+  labs(y="Taxa similarity (%)")+
+  annotation_custom(aqua_png, xmin = 17.5, xmax = 20, ymin = 0.8, ymax = 1.05)+
+  annotation_custom(fishing_png, xmin = 23, xmax = 26.5, ymin = 0.75, ymax = 1.06)+
+  geom_segment(x = 20.8, xend = 23, y = 0.93, yend=0.93, arrow = arrow(ends = "both", type="open", length = unit(0.13, "cm")))+
+    
+     
+  
+  ggsave(here("explore", "cottrell_explore", "Figure new a.jpg"), device = "jpg", dpi=300, width = 9, height=7, units = "cm")
+)
+
+
+ggarrange(dissimilarity_Map, disimilarity_BT,
+         nrow =2, 
+         ncol=1,
+         labels = letters[1:2],
+         label.y = c(1, 1.05),
+         font.label = list(size=8)) +
+  ggsave(here("output", "figs", "Figure 3 (revision) - aquaculture fisheries dissimalrity.jpg"), device = "jpg", dpi=600, width = 9, height = 13, units="cm")+
+  ggsave(here("output", "figs", "Figure 3 (revision) - aquaculture fisheries dissimalrity.pdf"), device = "pdf", dpi=600, width = 9, height = 13, units="cm")+
+  ggsave(here("output", "figs", "Figure 3 (revision) - aquaculture fisheries dissimalrity.tiff"), device = "tiff", dpi=600, width = 9, height = 13, units="cm")
+
+global_sector_comparisons %>% arrange(-bray_curtis) %>% filter(bray_curtis==0)
+
+bt_sector_comparisons %>% 
+  filter(bray_curtis<0.5) %>% 
+  mutate(sim = 1-bray_curtis)
+
+unique(production_tidy$country_name)
+
+
+full_join(global_capture, global_aqua, by=c("country", "country_name", "species")) %>% 
+  arrange(country) %>% 
+    # mutate(capture = case_when(is.na(capture) ~ 0,
+    #                            TRUE ~ capture),
+    #        aquaculture = case_when(is.na(aquaculture) ~ 0, 
+    #                                TRUE ~ aquaculture)) %>% 
+    mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+  filter(country_name == "Russian Federation")
+
+
+bt_sector_comparisons %>% arrange(-bray_curtis)
+
+
+global_similarity %>% filter(country_name=="Philippines" & year ==2017)
+
+global_sector_comparisons %>% filter(country_name=="Philippines" & year==2017)
+```
+
+#systems composition dissimilarity
+```{r}
+
+test_dat <- vroom(file.path(dir_raw_data, "FAO", "production", "TS_FI_AQUACULTURE.csv"))
+
+test_dat %>% arrange(COUNTRY, YEAR)
+
+(meta_source <- vroom(file.path(dir_raw_data, "FAO", "production", "CL_FI_PRODUCTION_SOURCE.csv")) %>% rename(source=Identifier))
+(meta_area <- vroom(file.path(dir_raw_data, "FAO", "production", "CL_FI_WATERAREA_GROUPS.csv")) %>% rename(area=Code) %>% mutate(area = as.numeric(area)))
+
+#source
+#1=FW aquculture
+#2 = BW aquaculture
+#3 = marine aquaculture
+#4 = capture
+
+
+(total_aqua <- production_tidy_2 %>% 
+  left_join(meta_source, by="source") %>% 
+  left_join(meta_area, by="area") %>% 
+  select(!c(Name_En,Name_Fr, Name_Es, Name_fr, Name_es, Ocean_Group, Major_Group, FARegion_Group)) %>% 
+  filter(sector=="Aquaculture"  & year ==2017) %>% 
+    mutate(system = case_when(Code == "FRESHWATER" ~ "Inland",
+                              TRUE ~ "Marine"))%>% 
+    group_by(country, country_name, system) %>% 
+    summarise(aquaculture = sum(quantity)))
+
+(total_capture <- production_tidy_2 %>% 
+  left_join(meta_source, by="source") %>% 
+  left_join(meta_area, by="area") %>% 
+  select(!c(Name_En,Name_Fr, Name_Es, Name_fr, Name_es, Ocean_Group, Major_Group, FARegion_Group)) %>% 
+  filter(sector=="Capture" & year ==2017) %>% 
+    mutate(system = case_when(grepl("Inland waters", Name_en) ~ "Inland",
+                              TRUE ~ "Marine")) %>% 
+    group_by(country, country_name, system) %>% 
+    summarise(capture = sum(quantity))
+    
+    )
+
+(system_comparison <- full_join(total_aqua, total_capture, by=c("country", "country_name", "system")) %>% 
+  arrange(country_name) %>% 
+  filter(!country_name %in% non_coproducers) %>% 
+  filter(!(is.na(aquaculture) & is.na(capture))) %>% 
+    mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+    group_by(country, country_name) %>% #bray curtis calculations
+    mutate(lesser = pmin(aquaculture, capture, na.rm = FALSE)) %>% 
+    group_by(country, country_name) %>% #bray curtis calculations
+    summarise(sum_lesser = sum(lesser, na.rm = TRUE), #numerator
+              total_capture = sum(capture, na.rm = TRUE),
+              total_aqua = sum(aquaculture, na.rm = TRUE)) %>% 
+    mutate(sector_totals = sum(total_capture, total_aqua)) %>% #denominator
+    mutate(bray_curtis = round(((2*sum_lesser)/sector_totals), digits = 3)*100) %>% 
+    mutate(iso_a3 = countrycode(country_name, origin="country.name", destination = "iso3c", warn=TRUE)) %>% 
+    drop_na(iso_a3) %>%
+  arrange(country_name))
+
+
+#attach data to shapefile
+
+countries_shp<-readOGR(countries_dir, layer="ne_110m_admin_0_countries")
+#prod_dist <- prod_dist[!prod_dist$iso_a3 %in% c("ATA"),] #remove antartica
+countries_shp<-spTransform(countries_shp, CRS("+proj=robin"))
+countries_shp@data$id<-rownames(countries_shp@data)
+countries_shp@data<-left_join(countries_shp@data, system_comparison, by="iso_a3")
+countries_shp_df<-fortify(countries_shp)
+countries_shp_df<-left_join(countries_shp_df, countries_shp@data, by="id")
+
+
+(dissimilarity_Map_2 <- ggplot(data=bbox_df, aes(long,lat, group=group)) +
+  geom_polygon(fill="aliceblue", colour= NA, size=0.2)+
+  geom_map(data=countries_shp_df, map=countries_shp_df, aes(x=long, y=lat,fill=bray_curtis, group=group, map_id=id), colour="grey20", size=0.04)+
+  theme_pubr()+
+  theme(panel.grid = element_blank(),
+        text = element_text(size=6),
+        legend.title = element_text(size=6))+
+   scale_fill_stepsn(colors = (lemon_pal), limits=c(0,100), n.breaks = 10, show.limits = TRUE)+
+  theme_void()+
+  theme(legend.position = "bottom")+
+  labs(fill = bquote(Environment~similarity~("%")))+
+  guides(fill = guide_colourbar(title.position = "top", title.hjust = 0.5, barwidth = unit(6, "cm"), barheight = unit(0.24, "cm") ))+
+  ggsave(here("explore", "cottrell_explore", "Map dissimilarity_2.jpg"), device = "jpg", dpi=300, width = 9, height=6.3, units = "cm")
+  
+)
+
+
+
+(disimilarity_BT_2 <- ggplot(data=system_comparison %>% filter(country_name %in% c(bt_sector_comparisons$country_name)), aes(x=reorder(country_name, bray_curtis), y=bray_curtis))+
+ 
+  geom_segment(aes(x=reorder(country_name, -bray_curtis), xend=reorder(country_name, -bray_curtis), y=0, yend=bray_curtis), colour=lacroix_palette("Lemon", n=10)[2], size=1)+
+   geom_point( colour=lacroix_palette("Lemon", n=3)[3], size=2)+
+  theme_pubr()+
+  theme(axis.title.x = element_blank(),
+        text = element_text(size=8),
+        axis.text.x = element_text(angle=45, hjust=1, size = 6),
+        plot.margin = unit(c(0.5, 0.2,0.2,0.2), units = "cm"),
+        panel.grid.major.y = element_line(colour="grey70", linetype = 2)
+        )+
+  scale_y_continuous(limits = c(0,100), breaks = c(0,25, 50, 75,100), labels = c(0,25,50,75,100))+
+  #geom_hline(yintercept = 0.5*100, colour = "grey70", linetype=2)+
+  labs(y="Environment similarity (%)")+
+  annotation_custom(aqua_png, xmin = 17.5, xmax = 20, ymin = 0.8*100, ymax = 1.05*100)+
+  annotation_custom(fishing_png, xmin = 23, xmax = 26.5, ymin = 0.75*100, ymax = 1.06*100)+
+  geom_segment(x = 20.8, xend = 23, y = 0.93*100, yend=0.93*100, arrow = arrow(ends = "both", type="open", length = unit(0.13, "cm")))+
+    
+     
+  
+  ggsave(here("explore", "cottrell_explore", "Figure new b.jpg"), device = "jpg", dpi=300, width = 9, height=7, units = "cm")
+)
+
+
+production_tidy_2 %>% filter(country_name == "Russian Federation")
+
+
+#quick plot stats 
+
+system_comparison %>% 
+  arrange(-bray_curtis)
+
+system_comparison %>% filter(country_name %in% c(bt_sector_comparisons$country_name)) %>% arrange(-bray_curtis)
+```
+
+#Compose composite plot
+```{r}
+
+ggarrange(dissimilarity_Map, disimilarity_BT,
+          dissimilarity_Map_2, disimilarity_BT_2,
+          labels = c("a", "b", "c", "d"),
+          font.label = list(size=8),
+          ncol=2,
+          nrow = 2)+
+  ggsave(here("explore", "cottrell_explore", "Figure - similarity.jpg"), device = "jpg", dpi=600, height = 13, width = 18, units = "cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure - similarity.tiff"), device = "tiff", dpi=600, height = 13, width = 18, units = "cm")+
+  ggsave(here("explore", "cottrell_explore", "Figure - similarity.pdf"), device = "pdf", dpi=600, height = 12, width = 18, units = "cm")
+
+
+
+
+```
+
+#Instrumental variable test
+
+```{r}
+
+unique(total_food_bal$element)
+
+(feed <- total_food_bal %>% filter(element=="Feed") %>% 
+  filter(item %in% c("Cassava and products", "Rape and Mustardseed", "Rape and Mustard Oil", "Soyabean Oil","Soyabeans", "Maize and products", "Groundnut Oil",  "Groundnuts (Shelled Eq)",  "Wheat and products", "Cottonseed", "Ricebran Oil", "Sunflower seed", "Rice (Milled Equivalent)", "Cassava and products" , "Peas", "Beans")) %>%  #taken from feed constituents listed in troell
+  group_by(area_code, area, year) %>% 
+  summarise(feed= sum(quantity)*1000) %>% 
+  mutate(country = countrycode(area, origin = "country.name", destination = "iso3n", warn=TRUE)) %>% 
+  rename(country_name = area)%>% 
+  ungroup() %>% 
+  select(country, year, feed, -area_code))
+
+
+(blue_prod_with_feed <- blue_prod_w_covariates %>% 
+  left_join(feed, by=c("country",  "year")) %>% 
+     mutate(feed_avail = feed/aquaculture_prod) %>% 
+    mutate(feed_avail = case_when(aquaculture_prod == 0 ~ 0,
+                                  TRUE ~ feed_avail)))
+
+(blue_prod_with_feed_2 <- blue_prod_w_covariates_2%>% 
+  left_join(feed, by=c("country", "year")) %>% 
+              mutate(feed_avail = feed/aquaculture_prod)%>% 
+    mutate(feed_avail = case_when(aquaculture_prod == 0 ~ 0,
+                                  TRUE ~ feed_avail))
+)
+
+
+
+
+ggplot(data = blue_prod_with_feed_2, aes(x=feed, y=aqua_prod_caput_kg))+
+  #geom_line()+
+  geom_point()#+
+  #facet_wrap(~country_name, scales = "free")
+#With seaweeds
+
+
+summary(lm(aqua_prod_caput_kg~feed_avail, data = blue_prod_with_feed_2))
+
+
+#manual approach to two stage least squares estimator
+
+#BT COUNTRIES WITH ALGAE
+
+#first stage - use other predictors and feed as an instrumental variable to predict aquaculture (log using ols)
+stage1_manual_model <- (lm(data = blue_prod_with_feed  %>% 
+              filter(country_name != "Cyprus")  %>%
+    mutate(country = factor(country)) %>% 
+    mutate(country = relevel(country, ref=6)) %>% #data source
+      mutate(aqua_prod_caput_kg = case_when(aqua_prod_caput_kg == 0 ~ 0.0000001,
+                                            TRUE ~ aqua_prod_caput_kg)), 
+  formula = log(aqua_prod_caput_kg)  ~ feed + fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + factor(country) + factor(year)))
+
+#T-test on coefficients
+coeftest(stage1_manual_model, vcov = vcovHC, type = "HC1")
+
+summary(stage1_manual_model)$r.squared # 66% explained
+
+#extract fitted values from model
+aquaculture_fits <- stage1_manual_model$fitted.values
+
+#stage2
+
+min_val <- min(blue_prod_with_feed$capture_prod_caput_kg)
+
+stage2_manual_model <- lm(data = blue_prod_with_feed %>% 
+     filter(country_name != "Cyprus")  %>%
+     mutate(country = factor(country)) %>% 
+     mutate(country = relevel(country, ref=6)) %>% 
+     mutate(aqua_fits = aquaculture_fits), 
+   formula = log(capture_prod_caput_kg+min_val) ~ aqua_fits + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) +log(urbanization+min_val)  + log(cum_shocks+min_val) + log(capture_CV+min_val) + factor(country_name) +factor(year), na.action = "na.fail")
+
+
+
+coeftest(stage2_manual_model, vcov = vcovHC) #t-test on coefficients - very low t-value of 3 - suggesting weak instrument
+
+#try the IV reg stage
+
+auto_IV_model <- ivreg::ivreg(formula = log(capture_prod_caput_kg+min_val) ~ aqua_fits + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val)  + factor(country_name) +factor(year) | feed_avail + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) + factor(country_name) +factor(year),
+      data = blue_prod_with_feed %>% 
+     filter(country_name != "Cyprus")  %>%
+     mutate(country = factor(country)) %>% 
+     mutate(country = relevel(country, ref=6)) %>% 
+     mutate(aqua_fits = aquaculture_fits))
+
+summary(auto_IV_model)
+
+coeftest(auto_IV_model, vcov = vcovHC, type = "HC1")
+
+
+
+#BT COUNTRIES WITHOUT ALGAE
+#Without seaweeds
+
+
+#first stage - use other predictors and feed as an instrumental variable to predict aquaculture (log using ols)
+stage1_manual_model_2 <- (lm(data = blue_prod_with_feed_2  %>% 
+              filter(country_name != "Cyprus")  %>%
+    mutate(country = factor(country)) %>% 
+    mutate(country = relevel(country, ref=6)) %>% #data source
+      mutate(aqua_prod_caput_kg = case_when(aqua_prod_caput_kg == 0 ~ 0.0000001,
+                                            TRUE ~ aqua_prod_caput_kg)), 
+  formula = log(aqua_prod_caput_kg)  ~ feed_avail + fish_supply + exports_caput_kg + gdp2 + a_d_ratio  + factor(country) + factor(year)))
+
+#T-test on coefficients
+coeftest(stage1_manual_model_2, vcov = vcovHC, type = "HC1")
+
+summary(stage1_manual_model_2)$r.squared # 66% explained
+
+#extract fitted values from model
+aquaculture_fits_2 <- stage1_manual_model$fitted.values
+
+
+#stage2
+
+min_val <- min(blue_prod_with_feed_2$capture_prod_caput_kg)
+
+stage2_manual_model <- lm(data = blue_prod_with_feed_2 %>% 
+     filter(country_name != "Cyprus")  %>%
+     mutate(country = factor(country)) %>% 
+     mutate(country = relevel(country, ref=6)) %>% 
+     mutate(aqua_fits = aquaculture_fits_2), 
+   formula = log(capture_prod_caput_kg+min_val) ~ aqua_fits + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) + factor(country_name) +factor(year), na.action = "na.fail")
+
+
+
+coeftest(stage2_manual_model, vcov = vcovHC) #t-test on coefficients - very low t-value of 3 - suggesting weak instrument
+
+
+
+
+auto_IV_model_2 <- ivreg::ivreg(formula = log(capture_prod_caput_kg+min_val) ~ aqua_fits + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val)  + factor(country_name) +factor(year) | feed_avail + log(fish_supply+min_val) + log(exports_caput_kg+min_val) + log(gdp2+min_val) + log(a_d_ratio+min_val) + factor(country_name) +factor(year),
+      data = blue_prod_with_feed_2 %>% 
+     filter(country_name != "Cyprus")  %>%
+     mutate(country = factor(country)) %>% 
+     mutate(country = relevel(country, ref=6)) %>% 
+     mutate(aqua_fits = aquaculture_fits_2))
+
+summary(auto_IV_model_2)
+
+```
+
+

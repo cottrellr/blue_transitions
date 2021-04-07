@@ -1,0 +1,71 @@
+---
+title: "Tidy data: Food Balance Sheets and environmental impacts of food"
+author: "Gordon Blasco, Danielle Ferraro"
+date: "9/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This document contains code to tidy data for Track 2 of the Clean Seafood project. We use FAO Food Balance Sheets for food supply data, as well as supplemental information from Poore and Nemecek (2018) for data on the environmental impacts of foods.
+
+## Setup
+```{r}
+library(tidyverse)
+library(janitor)
+
+
+```
+
+
+## Import data
+```{r}
+# Food balance sheets
+food_balance <- read_csv(file.path(dir_raw_data, "FAO/food_balance/FoodBalanceSheets_E_All_Data_NOFLAG.csv"))
+
+area_code <- food_balance %>% 
+  distinct(`Area`, `Area Code`) %>% 
+  clean_names()
+
+item_code <- food_balance %>% 
+  distinct(`Item`, `Item Code`) %>% 
+  clean_names()
+
+element_code <- food_balance %>% 
+  distinct(`Element`, `Element Code`) %>% 
+  clean_names()
+
+# Poore and Nemecek (2018)
+
+env_impacts <- read_xls(file.path(dir_raw_data, "poore_and_nemecek_food_impacts", "aaq0216_DataS2.xls"), range = "A2:AQ46") # The specified range imports the randomized/resampled data only
+```
+
+## Tidy data
+```{r}
+# Food balance sheets
+clean_food_balance <- food_balance %>% 
+  gather(
+    key = "year",
+    value = "quantity",
+    c(8:60)
+  ) %>% 
+  clean_names() %>% 
+  mutate(year = parse_number(year))
+```
+
+## Write the csv's
+```{r}
+
+# Food balance sheets
+write_csv(clean_food_balance, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "food_balance_tidy.csv"))
+write_csv(area_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "area_code.csv"))
+write_csv(item_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "item_code.csv"))
+write_csv(element_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "element_code.csv"))
+
+
+```
+
